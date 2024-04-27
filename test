@@ -287,3 +287,4 @@ def handle_builder_request():
 if __name__ == '__main__':
     # main()
     app.run(port=5000)
+ --- I want to get compare the rendered image with the original image and then compute the gradient back to the voxel grid and update that with stochastic gradient decent. Can you explain to me what steps I would need to take to enable this in my small JAX project here?
