@@ -189,7 +189,6 @@ def render_pixel(x, y, camera_view_matrix, voxel_grid):
     color = trace_ray(origin, direction, voxel_grid)
     return color
 
-
 @jit
 def render(camera_view_matrix, voxel_grid):
     pixel_coords = jnp.meshgrid(jnp.arange(image_width), jnp.arange(image_height))
@@ -200,6 +199,46 @@ def render(camera_view_matrix, voxel_grid):
 
     image = vmap(render_fn)(pixel_coords)[:, :3].reshape(image_height, image_width, 3)
     return image
+
+
+def loss_fn(rendered_image, original_image):
+    # Compute and return the loss value between the rendered and original images
+    # Compute the squared difference between the images
+    squared_diff = jnp.square(rendered_image - original_image)
+
+    # Calculate the mean of the squared differences
+    mse = jnp.mean(squared_diff)
+
+    return mse
+
+
+def optimization_step(camera_view_matrix, voxel_grid, original_image, learning_rate):
+    print("starting gradient compiling")
+    grad_fn = jax.grad(compute_visual_loss_for, argnums=1)
+    print("starting gradient computation")
+    voxel_grid_grad = grad_fn(camera_view_matrix, voxel_grid, original_image)
+    print("Got Grad")
+    voxel_grid -= learning_rate * voxel_grid_grad
+    return voxel_grid
+
+@jit
+def compute_visual_loss_for(camera_view_matrix, voxel_grid, original_image):
+    rendered_image = render(camera_view_matrix, voxel_grid)
+    loss = loss_fn(rendered_image, original_image)
+    return loss
+
+def train(camera_view_matrix, voxel_grid, original_image, num_iterations, learning_rate):
+    rendered_image = render(camera_view_matrix, voxel_grid)
+    print(loss_fn(rendered_image, original_image))
+    show_visual_comparison(original_image, rendered_image)
+
+    for _ in range(num_iterations):
+        voxel_grid = optimization_step(camera_view_matrix, voxel_grid, original_image, learning_rate)
+
+        rendered_image = render(camera_view_matrix, voxel_grid)
+        show_visual_comparison(original_image, rendered_image)
+
+    return voxel_grid
 
 
 def main():
@@ -247,6 +286,24 @@ def transform_initial_voxel_grid(voxel_grid):
     return output
 
 
+def show_visual_comparison(original_image, rendered_image):
+    # Display original image with rendered image overlay, and rendered image separately
+    fig, axs = plt.subplots(1, 2)
+
+    # Plot the original image
+    axs[0].imshow(original_image)
+
+    axs[0].axis('off')
+    axs[0].set_title('Original Image with Rendered Overlay')
+
+    # Plot the rendered image without transparency
+    axs[1].imshow(rendered_image)
+    axs[1].axis('off')
+    axs[1].set_title('Rendered Image')
+
+    plt.show()
+
+
 @app.route('/builder', methods=['POST'])
 def handle_builder_request():
     data = request.get_json()
@@ -263,23 +320,11 @@ def handle_builder_request():
         original_image = mpimg.imread(image_buf, format='png')
         original_image = original_image[:, :, :3]
 
-        image = render(jnp.array(cam_data['viewMatrix']), voxel_grid)
+        view_matrix = jnp.array(cam_data['viewMatrix'])
 
-        # Display original image with rendered image overlay, and rendered image separately
-        fig, axs = plt.subplots(1, 2)
+        rendered_image = render(view_matrix, voxel_grid)
 
-        # Plot the original image
-        axs[0].imshow(original_image)
-
-        axs[0].axis('off')
-        axs[0].set_title('Original Image with Rendered Overlay')
-
-        # Plot the rendered image without transparency
-        axs[1].imshow(image)
-        axs[1].axis('off')
-        axs[1].set_title('Rendered Image')
-
-        plt.show()
+        show_visual_comparison(original_image, rendered_image)
 
     return jsonify({'message': 'Data received successfully'})
 
