@@ -1,17 +1,151 @@
 import base64
 import io
+import random
+import time
 
 import jax
 import jax.numpy as jnp
+from PIL import Image
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from jax import lax, vmap, jit
+from jax.example_libraries import optimizers
 from matplotlib import pyplot as plt, image as mpimg
+
+print(jax.version)
+
+
+def load_obj(file_path):
+    vertices = []
+    texture_coords = []
+    faces = []
+
+    with open(file_path, 'r') as file:
+        for line in file:
+            if line.startswith('v '):
+                vertex = [float(x) for x in line.split()[1:]]
+                vertices.append(vertex)
+            elif line.startswith('vt '):
+                tex_coord = [float(x) for x in line.split()[1:]]
+                texture_coords.append(tex_coord)
+            elif line.startswith('f '):
+                face = []
+                for vertex_data in line.split()[1:]:
+                    vertex_indices = vertex_data.split('/')
+                    vertex_index = int(vertex_indices[0]) - 1
+                    texture_index = int(vertex_indices[1]) - 1
+                    face.append((vertex_index, texture_index))
+                faces.append(face)
+
+    vertices = jnp.array(vertices, dtype=jnp.float32)
+    texture_coords = jnp.array(texture_coords, dtype=jnp.float32)
+    faces = jnp.array(faces, dtype=jnp.int32)
+
+    return vertices, texture_coords, faces
+
+
+def load_texture(file_path):
+    image = Image.open(file_path)
+    image = image.convert('RGBA')
+    texture = jnp.array(image, dtype=jnp.float32) / 255
+    return texture
+
 
 epsilon = 1e-6
 
-image_width = 250
-image_height = 250
+
+def find_intersections(ray_origin, ray_direction, vertices, texture_coords, faces, texture):
+    intersection_colors_with_distance = jnp.zeros((faces.shape[0], 4 + 1), dtype=jnp.float32)
+
+    def append_intersection(i, t, u, v, face):
+        # Get texture coordinates of the intersection point
+        uv = texture_coords[face[:, 1]]
+        barycentric_coords = jnp.array([1 - u - v, u, v])
+        interpolated_uv = jnp.sum(uv * barycentric_coords[:, None], axis=0)
+
+        # Get color from the texture using nearest neighbor interpolation
+        tex_h, tex_w = texture.shape[:2]
+        tex_x = jnp.clip(jnp.round(interpolated_uv[0] * (tex_w - 1)), 0, tex_w - 1).astype(int)
+        tex_y = jnp.clip(jnp.round(interpolated_uv[1] * (tex_h - 1)), 0, tex_h - 1).astype(int)
+        color = texture[tex_y, tex_x]
+
+        color_with_distance = jnp.concatenate([color, jnp.expand_dims(t, axis=0)], axis=0)
+
+        return intersection_colors_with_distance.at[i].set(color_with_distance)
+
+    def do_nothing(i, t, u, v, face):
+        return intersection_colors_with_distance
+
+    for i in range(faces.shape[0]):
+        face = faces[i]
+
+        v0, v1, v2 = vertices[face[:, 0]]
+        edge1 = v1 - v0
+        edge2 = v2 - v0
+        ray_cross_e2 = jnp.cross(ray_direction, edge2)
+        det = jnp.dot(edge1, ray_cross_e2)
+
+        invalid_det = jnp.logical_and(det > -epsilon, det < epsilon)
+
+        inv_det = 1.0 / det
+        s = ray_origin - v0
+        u = inv_det * jnp.dot(s, ray_cross_e2)
+
+        invalid_u = jnp.logical_or(u < 0, u > 1)
+
+        s_cross_e1 = jnp.cross(s, edge1)
+        v = inv_det * jnp.dot(ray_direction, s_cross_e1)
+
+        invalid_uv = jnp.logical_or(v < 0, u + v > 1)
+
+        t = inv_det * jnp.dot(edge2, s_cross_e1)
+
+        invalid_t = t < epsilon
+
+        is_invalid_intersection = jnp.logical_or(invalid_det, invalid_u)
+        is_invalid_intersection = jnp.logical_or(is_invalid_intersection, invalid_uv)
+        is_invalid_intersection = jnp.logical_or(is_invalid_intersection, invalid_t)
+
+        intersection_colors_with_distance = lax.cond(is_invalid_intersection,
+                                                     lambda _: do_nothing(i, t, u, v, face),
+                                                     lambda _: append_intersection(i, t, u, v, face),
+                                                     operand=None)
+
+    return intersection_colors_with_distance
+
+@jit
+def get_ray_colour(ray_origin, ray_direction, vertices, texture_coords, faces, texture):
+    # Find intersection points with triangles
+    intersection_colors_with_distance = find_intersections(
+        ray_origin, ray_direction, vertices, texture_coords, faces, texture
+    )
+
+    # Sort colors by distance
+    distances = intersection_colors_with_distance[:, -1]
+    indices = jnp.argsort(distances)
+    sorted_colors = intersection_colors_with_distance[indices]
+
+    # Blend colors using alpha channel
+    blended_color = jnp.zeros(4)
+
+    for color in sorted_colors:
+        blended_color = blend(blended_color, color[:-1])  # exclude distance from blending
+
+    return blended_color
+
+
+image_width = 150
+image_height = 150
+
+jax_random_key = jax.random.key(0)
+
+verts, texs, faces = load_obj("models/cube.obj")
+voxel_assets = [
+    (jnp.zeros((0, 3)), jnp.zeros((0, 2)), jnp.zeros((0, 3, 2), dtype=jnp.int32), load_texture("models/dirt.png")),
+    (verts, texs, faces, load_texture("models/dirt.png")),
+]
+
+num_voxel_assets = voxel_assets.__len__()
 
 
 def spawn_ray(pixel_coords_x, pixel_coords_y, camera_view_matrix):
@@ -89,34 +223,49 @@ def get_first_intersection_with_voxel_grid(ray_origin, ray_direction):
                     compute_intersection_point_from_outside, ray_origin, ray_direction)
 
 
-def getBackgroundColor(intersection_point, ray_direction, voxel_grid):
-    return jnp.zeros(4)
-
-
-def compute_voxel_color(voxel_indices, voxel_grid):
-    return voxel_grid[voxel_indices[0], voxel_indices[1], voxel_indices[2]]
-
-
-def ray_stopped_by_occlusion(current_color):
-    return current_color[3] > 0.99
-
-
-def blend(current_color, local_color):
-    alpha_blend = current_color[3] * (1.0 - local_color[3])
-    new_r = current_color[0] * alpha_blend + local_color[0] * local_color[3]
-    new_g = current_color[1] * alpha_blend + local_color[1] * local_color[3]
-    new_b = current_color[2] * alpha_blend + local_color[2] * local_color[3]
-    new_a = current_color[3] * (1.0 - local_color[3]) + local_color[3]
-    return jnp.array([new_r, new_g, new_b, new_a])
+def getBackgroundColor(intersection_point, ray_direction, subdivisions):
+    return jnp.zeros((num_voxel_assets, 4))
 
 
 def get_subdivisions(voxel_grid):
-    return voxel_grid.shape[0]
+    return jnp.int32(voxel_grid.shape[0])
 
 
-def ray_voxel_traversal(intersection_point, ray_direction, voxel_grid):
-    subdivisions = get_subdivisions(voxel_grid)
+def get_color_per_asset(voxel_indices, voxel_size, intersection_point, ray_direction):
+    # Return the color contribution for the asset at the given voxel indices
+    # using the intersection point and ray direction
+    # ...
 
+    # transform ray_origin to unit cube
+    voxel_local_position = jnp.array([0.0, voxel_size/2, voxel_size/2])
+    unit_cube_origin = -0.5 + voxel_local_position / voxel_size
+
+    # Now to be safe move it out of the cube a little
+    unit_cube_origin = unit_cube_origin - ray_direction * 1e-3
+
+    asset_colors = jnp.zeros((num_voxel_assets, 4))
+
+    for i in range(num_voxel_assets):
+        vertices, texture_coords, faces, texture_image = voxel_assets[i]
+
+        colour = get_ray_colour(unit_cube_origin, ray_direction, vertices, texture_coords, faces, texture_image)
+
+        asset_colors = asset_colors.at[i].set(colour)
+
+    return asset_colors
+
+
+def valid_grid_indices(voxel_indices, subdivisions):
+    return jnp.all(jnp.logical_and(voxel_indices >= 0, voxel_indices < subdivisions))
+
+
+def cond_fun(carry):
+    voxel_indices, _, _, color_contributions_in_visited_voxels, _ = carry
+    subdivisions = color_contributions_in_visited_voxels.shape[0]
+    return valid_grid_indices(voxel_indices, subdivisions)
+
+
+def ray_voxel_traversal(intersection_point, ray_direction, subdivisions, empty_contributions, empty_contribution_map):
     # Convert the intersection point to the index of the hit voxel
     voxel_indices = convert_position_to_voxel_indices(intersection_point, subdivisions)
 
@@ -139,66 +288,93 @@ def ray_voxel_traversal(intersection_point, ray_direction, voxel_grid):
         voxel_size / jnp.abs(ray_direction)
     )
 
-    def valid_grid_indices(voxel_indices):
-        return jnp.all(jnp.logical_and(voxel_indices >= 0, voxel_indices < subdivisions))
-
-    def cond_fun(carry):
-        voxel_indices, t_max, color = carry
-        return jnp.logical_and(jnp.logical_not(ray_stopped_by_occlusion(color)),
-                               valid_grid_indices(voxel_indices))
-
     def body_fun(carry):
-        voxel_indices, t_max, color = carry
+        voxel_indices, t_max, step_counter, color_contributions_in_visited_voxels, contributing_voxel_matrix = carry
 
         # Update voxel indices and t_max based on the minimum t_max component
         axis = jnp.argmin(t_max)
         voxel_indices = voxel_indices.at[axis].add(step[axis])
         t_max = t_max.at[axis].add(t_delta[axis])
 
-        def get_updated_ray_color(current_color):
-            local_color = compute_voxel_color(voxel_indices, voxel_grid)
+        local_intersection_point = intersection_point + ray_direction * t_max[axis]
+        color_contributions_in_visited_voxels = color_contributions_in_visited_voxels.at[step_counter].set(
+            lax.cond(valid_grid_indices(voxel_indices, subdivisions),
+                     lambda: get_color_per_asset(voxel_indices, voxel_size, local_intersection_point, ray_direction),
+                     lambda: jnp.zeros([num_voxel_assets, 4]),
+                     )
+        )
 
-            return blend(current_color, local_color)
+        contributing_voxel_matrix = lax.cond(valid_grid_indices(voxel_indices, subdivisions),
+                                             lambda voxel_indices, step_counter: contributing_voxel_matrix.at[
+                                                 step_counter].set(voxel_indices),
+                                             lambda voxel_indices, step_counter: contributing_voxel_matrix,
+                                             voxel_indices, step_counter
+                                             )
 
-        color = lax.cond(valid_grid_indices(voxel_indices), get_updated_ray_color, lambda current_color: current_color,
-                         color)
+        step_counter += 1
 
-        return voxel_indices, t_max, color
+        return voxel_indices, t_max, step_counter, color_contributions_in_visited_voxels, contributing_voxel_matrix
 
     # Initialize the carry variables
-    color = compute_voxel_color(voxel_indices, voxel_grid)
-    carry = (voxel_indices, t_max, color)
+    color_contributions_in_visited_voxels = empty_contributions
+    contributing_voxel_matrix = empty_contribution_map
+    step_counter = 0
+    carry = (voxel_indices, t_max, step_counter, color_contributions_in_visited_voxels, contributing_voxel_matrix)
 
     # Run the while loop using lax.while_loop
-    voxel_indices, t_max, color = lax.while_loop(cond_fun, body_fun, carry)
+    voxel_indices, t_max, step_counter, color_contributions_in_visited_voxels, contributing_voxel_matrix = lax.while_loop(
+        cond_fun, body_fun,
+        carry)
 
-    return color
+    return color_contributions_in_visited_voxels, contributing_voxel_matrix
 
 
-def trace_ray(ray_origin, ray_direction, voxel_grid):
+def get_empty_contr(intersection_point, ray_direction, subdivisions, empty_contributions, empty_contribution_map):
+    return empty_contributions, empty_contribution_map
+
+
+def compute_num_max_intersections_for(subdivisions):
+    return jnp.int32(jnp.ceil(jnp.sqrt(subdivisions ** 2 + subdivisions ** 2)))
+
+
+def trace_ray(ray_origin, ray_direction, subdivisions):
     intersection_point = get_first_intersection_with_voxel_grid(ray_origin, ray_direction)
 
     no_intersection = jnp.all(jnp.equal(intersection_point, jnp.array([-1.0, -1.0, -1.0])))
 
-    return lax.cond(no_intersection, getBackgroundColor, ray_voxel_traversal,
-                    intersection_point, ray_direction, voxel_grid)
+    num_max_intersection = compute_num_max_intersections_for(subdivisions)
+
+    empty_contributions = jnp.zeros((num_max_intersection, num_voxel_assets, 4), dtype=jnp.float16)
+    empty_contribution_map = jnp.full((num_max_intersection, 3), -1, dtype=jnp.int16)
+
+    return lax.cond(no_intersection,
+                    get_empty_contr,
+                    ray_voxel_traversal,
+                    intersection_point, ray_direction, subdivisions, empty_contributions, empty_contribution_map)
 
 
-def render_pixel(x, y, camera_view_matrix, voxel_grid):
+def render_pixel(x, y, camera_view_matrix, subdivisions):
     origin, direction = spawn_ray(x, y, camera_view_matrix)
-    color = trace_ray(origin, direction, voxel_grid)
+    color = trace_ray(origin, direction, subdivisions)
     return color
 
-@jit
-def render(camera_view_matrix, voxel_grid):
+
+def get_num_voxels(subdivisions):
+    return subdivisions ** 3
+
+
+def render(camera_view_matrix, subdivisions):
     pixel_coords = jnp.meshgrid(jnp.arange(image_width), jnp.arange(image_height))
     pixel_coords = jnp.stack(pixel_coords, axis=-1).reshape(-1, 2)
 
     def render_fn(coords):
-        return render_pixel(coords[0], coords[1], camera_view_matrix, voxel_grid)
+        return render_pixel(coords[0], coords[1], camera_view_matrix, subdivisions)
 
-    image = vmap(render_fn)(pixel_coords)[:, :3].reshape(image_height, image_width, 3)
-    return image
+    num_max_intersection = compute_num_max_intersections_for(subdivisions)
+    image, index_map = vmap(render_fn)(pixel_coords)
+    image = image.reshape(image_height, image_width, num_max_intersection, num_voxel_assets, 4)
+    index_map = index_map.reshape(image_height, image_width, num_max_intersection, 3)
+    return image, index_map
 
 
 def loss_fn(rendered_image, original_image):
@@ -212,87 +388,93 @@ def loss_fn(rendered_image, original_image):
     return mse
 
 
-def optimization_step(camera_view_matrix, voxel_grid, original_image, learning_rate):
+def optimization_step(caches, index_maps, original_images, opt_state, get_params, opt_update, step):
     print("starting gradient compiling")
-    grad_fn = jax.grad(compute_visual_loss_for, argnums=1)
+    grad_fn = jax.grad(compute_visual_loss_for, argnums=0)
     print("starting gradient computation")
-    voxel_grid_grad = grad_fn(camera_view_matrix, voxel_grid, original_image)
+    start_time = time.time()
+    voxel_grid_grad = grad_fn(get_params(opt_state), caches, index_maps, original_images)
+    end_time = time.time()
+    print(f"make_cache_to_image took {end_time - start_time:.2f} seconds")
     print("Got Grad")
-    voxel_grid -= learning_rate * voxel_grid_grad
-    return voxel_grid
+    opt_state = opt_update(step, voxel_grid_grad, opt_state)
 
-@jit
-def compute_visual_loss_for(camera_view_matrix, voxel_grid, original_image):
-    rendered_image = render(camera_view_matrix, voxel_grid)
-    loss = loss_fn(rendered_image, original_image)
+    return opt_state
+
+
+def compute_visual_loss_for(voxel_grid, caches, index_maps, original_images):
+    rendered_images = make_cache_to_image(caches, index_maps, voxel_grid)
+    loss = loss_fn(rendered_images, original_images)
     return loss
 
-def train(camera_view_matrix, voxel_grid, original_image, num_iterations, learning_rate):
-    rendered_image = render(camera_view_matrix, voxel_grid)
-    print(loss_fn(rendered_image, original_image))
-    show_visual_comparison(original_image, rendered_image)
 
-    for _ in range(num_iterations):
-        voxel_grid = optimization_step(camera_view_matrix, voxel_grid, original_image, learning_rate)
+def get_train_batch(caches, index_maps, target_images, size: int):
+    num_views = caches.shape[0]
 
-        rendered_image = render(camera_view_matrix, voxel_grid)
-        show_visual_comparison(original_image, rendered_image)
+    # Generate random indices to select views
+    indices = jnp.array(random.sample(range(num_views), min(size, num_views)))
+
+    # Select the camera matrices and target images for the batch
+    batch_caches = caches[indices, ...]
+    batch_index_maps = index_maps[indices, ...]
+    batch_target_images = target_images[indices, ...]
+
+    return batch_caches, batch_index_maps, batch_target_images
+
+
+def train(camera_view_matrices, original_images, voxel_grid, num_iterations, learning_rate):
+    caches = []
+    index_maps = []
+
+    num_views = camera_view_matrices.shape[0]
+
+    for i in range(num_views):
+        cache, index_map = render(camera_view_matrices[i], get_subdivisions(voxel_grid))
+        caches.append(cache)
+        index_maps.append(index_map)
+
+    caches = jnp.stack(caches, axis=0)
+    index_maps = jnp.stack(index_maps, axis=0)
+
+    opt_init, opt_update, get_params = optimizers.adam(learning_rate)
+    opt_state = opt_init(voxel_grid)
+
+    for step in range(num_iterations):
+        batch_caches, batch_index_maps, batch_target_images = get_train_batch(caches, index_maps, original_images, 4)
+
+        opt_state = optimization_step(batch_caches, batch_index_maps, batch_target_images, opt_state, get_params,
+                                      opt_update, step)
+
+        if step % 10 == 0:
+            rendered_images = make_cache_to_image(batch_caches[:1], batch_index_maps[:1], get_params(opt_state))
+            show_visual_comparison(batch_target_images[0], rendered_images[0])
 
     return voxel_grid
-
-
-def main():
-    camera_view_matrix = jnp.array([
-        [0.0, 0.0, -1.0, 0.0],
-        [0.0, 1.0, 0.0, 0.0],
-        [1.0, 0.0, 0.0, 0.0],
-        [-2.0, 0.0, 0.0, 1.0]
-    ])
-
-    image = render(camera_view_matrix)
-
-    # Display the image using Matplotlib
-    # Save the image to a file
-    plt.imshow(image)
-    plt.imsave('white_image.png', image)
-    plt.axis('off')
-    plt.show(block=True)
 
 
 app = Flask(__name__)
 CORS(app)
 
 
-def transform_initial_voxel_grid(voxel_grid):
-    """
-    Transform a 3D bool array of shape (n, n, n) into a 4D float array of shape (n, n, n, 4)
-    where each voxel is assigned a random color with alpha 1.0 if the corresponding bool value is True.
-    """
+def transform_initial_voxel_grid(voxel_grid, sigma=10.0):
     # Check assumptions
     assert voxel_grid.ndim == 3, "Input voxel grid must be a 3D array"
     assert voxel_grid.dtype == bool, "Input voxel grid must be a bool array"
     n = voxel_grid.shape[0]
     assert voxel_grid.shape[1] == n and voxel_grid.shape[2] == n, "Input voxel grid must be a cube"
 
-    # Create a random color array with shape (n, n, n, 3)
-    random_colors = jax.random.uniform(jax.random.PRNGKey(0), shape=(n, n, n, 3), minval=0, maxval=1)
+    # Generate random Gaussian matrix B
+    B = jax.random.uniform(jax_random_key, (n, n, n, num_voxel_assets), dtype=jnp.float32)
 
-    # Create an alpha channel with shape (n, n, n, 1) filled with 1.0
-    alpha_channel = jnp.ones((n, n, n, 1))
-
-    # Combine the random colors and alpha channel to get the final output
-    output = jnp.where(voxel_grid[..., None], jnp.concatenate((random_colors, alpha_channel), axis=-1), 0)
-
-    return output
+    return B
 
 
 def show_visual_comparison(original_image, rendered_image):
     # Display original image with rendered image overlay, and rendered image separately
-    fig, axs = plt.subplots(1, 2)
+    fig, axs = plt.subplots(1, 2, figsize=(10, 5))  # Adjust the figsize as needed
 
     # Plot the original image
     axs[0].imshow(original_image)
-
     axs[0].axis('off')
     axs[0].set_title('Original Image with Rendered Overlay')
 
@@ -301,7 +483,55 @@ def show_visual_comparison(original_image, rendered_image):
     axs[1].axis('off')
     axs[1].set_title('Rendered Image')
 
+    plt.tight_layout()  # Adjust the spacing between subplots
     plt.show()
+
+
+def blend(current_color, local_color):
+    # Extract the color components
+    r, g, b, a = local_color
+
+    # Calculate the remaining alpha
+    remaining_alpha = 1.0 - current_color[3]
+
+    # Apply the modified "over" operator
+    result_color = jnp.array([
+        r * a * remaining_alpha + current_color[0],
+        g * a * remaining_alpha + current_color[1],
+        b * a * remaining_alpha + current_color[2],
+        a * remaining_alpha + current_color[3]
+    ])
+
+    return result_color
+
+
+def compute_final_color(colors):
+    final_color = jnp.array([0.0, 0.0, 0.0, 0.0])
+    return lax.fori_loop(0, colors.shape[0], lambda i, final_color: blend(final_color, colors[i]), final_color)[:3]
+
+
+def make_cache_to_image(caches, index_maps, voxel_grid):
+    batch_size, image_width, image_height, max_num_intersections, num_options, _ = caches.shape
+
+    # Create a mask for valid voxel indices
+    valid_mask = jnp.all(index_maps >= 0, axis=-1)
+
+    # Gather the voxel probabilities based on the index map
+    voxel_indices = jnp.where(valid_mask[..., None], index_maps, 0)
+    # apply softmax
+    voxel_logits = voxel_grid[voxel_indices[..., 0], voxel_indices[..., 1], voxel_indices[..., 2]]
+    voxel_probs = jax.nn.softmax(voxel_logits, axis=-1)
+
+    # Compute the weighted sum of asset colors
+    weighted_sum = jnp.sum(caches * voxel_probs[..., None], axis=-2)
+    weighted_sum = weighted_sum.reshape(batch_size * image_width * image_height, -1, 4)
+
+    # Apply compute_final_color to each batch element
+    images = jax.vmap(compute_final_color)(weighted_sum)
+
+    images = images.reshape(batch_size, image_width, image_height, 3)
+
+    return images
 
 
 @app.route('/builder', methods=['POST'])
@@ -310,25 +540,70 @@ def handle_builder_request():
     voxel_grid = transform_initial_voxel_grid(jnp.array(data['voxelGrid']))
     views = data['views']
 
+    camera_matrices = []
+    target_images = []
+
     for view in views:
+        # Get camera matrix
         cam_data = view['camera']
+        view_matrix = jnp.array(cam_data['viewMatrix'])
 
         # Decode base64 encoded image data
         image_data = view['image'].split(',')[1]
         image_bytes = base64.b64decode(image_data)
         image_buf = io.BytesIO(image_bytes)
-        original_image = mpimg.imread(image_buf, format='png')
-        original_image = original_image[:, :, :3]
+        target_image = mpimg.imread(image_buf, format='png')
+        target_image = target_image[:, :, :3]
 
-        view_matrix = jnp.array(cam_data['viewMatrix'])
+        camera_matrices.append(view_matrix)
+        target_images.append(target_image)
 
-        rendered_image = render(view_matrix, voxel_grid)
+    camera_matrices = jnp.stack(camera_matrices, axis=0)
+    target_images = jnp.stack(target_images, axis=0)
 
-        show_visual_comparison(original_image, rendered_image)
+    train(camera_matrices, target_images, voxel_grid, 200, 0.5)
 
     return jsonify({'message': 'Data received successfully'})
 
 
+def render_block(camera_view_matrix):
+    pixel_coords = jnp.meshgrid(jnp.arange(image_width), jnp.arange(image_height))
+    pixel_coords = jnp.stack(pixel_coords, axis=-1).reshape(-1, 2)
+
+    def render_fn(coords):
+        origin, direction = spawn_ray(coords[0], coords[1], camera_view_matrix)
+        colour = get_ray_colour(origin, direction, voxel_assets[0][0], voxel_assets[0][1], voxel_assets[0][2],
+                                voxel_assets[0][3])
+        return colour
+
+    image = vmap(render_fn)(pixel_coords)
+    image = image.reshape(image_height, image_width, 4)
+
+    return image
+
+
+def render_a_block():
+    camera_view_matrix = jnp.array([
+        [1.0, 0.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0, 0.0],
+        [0.0, -0.1, 1.0, 0.0],
+        [0.0, 1.0, -4.0, 1.0]
+    ])
+
+    camera_view_matrix = jnp.array([
+        [0.0, 0.0, 1.0, 0.0],
+        [0.0, 1.0, 0.0, 0.0],
+        [1.0, -0.1, 0.0, 0.0],
+        [-4.0, 1.0, 0.0, 1.0]
+    ])
+
+    image = render_block(camera_view_matrix)
+
+    show_visual_comparison(image, image)
+    pass
+
+
 if __name__ == '__main__':
+    # render_a_block()
     # main()
     app.run(port=5000)
