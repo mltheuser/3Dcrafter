@@ -113,6 +113,7 @@ def find_intersections(ray_origin, ray_direction, vertices, texture_coords, face
 
     return intersection_colors_with_distance
 
+
 @jit
 def get_ray_colour(ray_origin, ray_direction, vertices, texture_coords, faces, texture):
     # Find intersection points with triangles
@@ -134,8 +135,8 @@ def get_ray_colour(ray_origin, ray_direction, vertices, texture_coords, faces, t
     return blended_color
 
 
-image_width = 150
-image_height = 150
+image_width = 512
+image_height = 512
 
 jax_random_key = jax.random.key(0)
 
@@ -143,11 +144,14 @@ verts, texs, faces = load_obj("models/cube.obj")
 voxel_assets = [
     (jnp.zeros((0, 3)), jnp.zeros((0, 2)), jnp.zeros((0, 3, 2), dtype=jnp.int32), load_texture("models/dirt.png")),
     (verts, texs, faces, load_texture("models/dirt.png")),
+    (verts, texs, faces, load_texture("models/cobblestone.png")),
+    (verts, texs, faces, load_texture("models/azalea_leaves.png")),
 ]
 
 num_voxel_assets = voxel_assets.__len__()
 
 
+@jit
 def spawn_ray(pixel_coords_x, pixel_coords_y, camera_view_matrix):
     camera_fov = 0.8
 
@@ -234,14 +238,28 @@ def get_subdivisions(voxel_grid):
 def get_color_per_asset(voxel_indices, voxel_size, intersection_point, ray_direction):
     # Return the color contribution for the asset at the given voxel indices
     # using the intersection point and ray direction
-    # ...
 
     # transform ray_origin to unit cube
-    voxel_local_position = jnp.array([0.0, voxel_size/2, voxel_size/2])
-    unit_cube_origin = -0.5 + voxel_local_position / voxel_size
+    # Currently the ray intersects a subvoxel of a voxelgrid that is centeres around 0,0,0 with a site length of 1 in all dimensions
+    # The asset models are also scaled to this unit cube so in order to compute the intersection correctly we need to transform the subvoxel local origin to the unit cube.
+    # Would we also need to do this for the direction I wonder?
 
-    # Now to be safe move it out of the cube a little
-    unit_cube_origin = unit_cube_origin - ray_direction * 1e-3
+    epsilon = 1e-5
+
+    intersection_point = intersection_point - ray_direction * epsilon
+    voxel_local_position = jnp.clip(intersection_point - (voxel_size * voxel_indices - 0.5), 0.0, voxel_size)
+
+    #jax.debug.print("isVlaid: {c}, voxel_indices: {x}, voxel_calc: {y}, intersection_point: {z}, 🤯 {r} 🤯",
+    #                c=valid_grid_indices(voxel_indices, 1 / voxel_size), x=voxel_indices,
+    #                y=(voxel_size * voxel_indices - 0.5), z=intersection_point, r=voxel_local_position)
+
+    unit_cube_origin = (voxel_local_position / voxel_size) - 0.5
+
+    #ray_direction = jnp.zeros((3,)) - unit_cube_origin
+    #ray_direction = ray_direction / jnp.linalg.norm(ray_direction)
+
+    # Move the origin slightly along the negative direction to avoid self-intersection
+    unit_cube_origin = unit_cube_origin - ray_direction * epsilon
 
     asset_colors = jnp.zeros((num_voxel_assets, 4))
 
@@ -264,7 +282,7 @@ def cond_fun(carry):
     subdivisions = color_contributions_in_visited_voxels.shape[0]
     return valid_grid_indices(voxel_indices, subdivisions)
 
-
+@jit
 def ray_voxel_traversal(intersection_point, ray_direction, subdivisions, empty_contributions, empty_contribution_map):
     # Convert the intersection point to the index of the hit voxel
     voxel_indices = convert_position_to_voxel_indices(intersection_point, subdivisions)
@@ -294,9 +312,11 @@ def ray_voxel_traversal(intersection_point, ray_direction, subdivisions, empty_c
         # Update voxel indices and t_max based on the minimum t_max component
         axis = jnp.argmin(t_max)
         voxel_indices = voxel_indices.at[axis].add(step[axis])
-        t_max = t_max.at[axis].add(t_delta[axis])
 
         local_intersection_point = intersection_point + ray_direction * t_max[axis]
+
+        t_max = t_max.at[axis].add(t_delta[axis])
+
         color_contributions_in_visited_voxels = color_contributions_in_visited_voxels.at[step_counter].set(
             lax.cond(valid_grid_indices(voxel_indices, subdivisions),
                      lambda: get_color_per_asset(voxel_indices, voxel_size, local_intersection_point, ray_direction),
@@ -605,5 +625,4 @@ def render_a_block():
 
 if __name__ == '__main__':
     # render_a_block()
-    # main()
     app.run(port=5000)
