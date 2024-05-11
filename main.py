@@ -1,7 +1,9 @@
 import base64
 import io
+import math
 import random
 import time
+from functools import partial
 
 import jax
 import jax.numpy as jnp
@@ -249,7 +251,7 @@ def get_color_per_asset(voxel_indices, voxel_size, intersection_point, ray_direc
     intersection_point = intersection_point - ray_direction * epsilon
     voxel_local_position = jnp.clip(intersection_point - (voxel_size * voxel_indices - 0.5), 0.0, voxel_size)
 
-    # jax.debug.print("isVlaid: {c}, voxel_indices: {x}, voxel_calc: {y}, intersection_point: {z}, 🤯 {r} 🤯",
+    #jax.debug.print("isVlaid: {c}, voxel_indices: {x}, voxel_calc: {y}, intersection_point: {z}, 🤯 {r} 🤯",
     #                c=valid_grid_indices(voxel_indices, 1 / voxel_size), x=voxel_indices,
     #                y=(voxel_size * voxel_indices - 0.5), z=intersection_point, r=voxel_local_position)
 
@@ -283,7 +285,6 @@ def cond_fun(carry):
     return valid_grid_indices(voxel_indices, subdivisions)
 
 
-@jit
 def ray_voxel_traversal(intersection_point, ray_direction, subdivisions, empty_contributions, empty_contribution_map):
     # Convert the intersection point to the index of the hit voxel
     voxel_indices = convert_position_to_voxel_indices(intersection_point, subdivisions)
@@ -367,7 +368,7 @@ def get_empty_contr(intersection_point, ray_direction, subdivisions, empty_contr
 
 
 def compute_num_max_intersections_for(subdivisions):
-    return jnp.int32(jnp.ceil(jnp.sqrt(subdivisions ** 2 + subdivisions ** 2)))
+    return int(math.ceil(math.sqrt(subdivisions ** 2 + subdivisions ** 2)))
 
 
 def trace_ray(ray_origin, ray_direction, subdivisions):
@@ -385,7 +386,6 @@ def trace_ray(ray_origin, ray_direction, subdivisions):
                     ray_voxel_traversal,
                     intersection_point, ray_direction, subdivisions, empty_contributions, empty_contribution_map)
 
-
 def render_pixel(x, y, camera_view_matrix, subdivisions):
     origin, direction = spawn_ray(x, y, camera_view_matrix)
     color = trace_ray(origin, direction, subdivisions)
@@ -395,26 +395,7 @@ def render_pixel(x, y, camera_view_matrix, subdivisions):
 def get_num_voxels(subdivisions):
     return subdivisions ** 3
 
-
-def render(camera_view_matrix, subdivisions):
-    pixel_coords = jnp.meshgrid(jnp.arange(image_width), jnp.arange(image_height))
-    pixel_coords = jnp.stack(pixel_coords, axis=-1).reshape(-1, 2)
-
-    num_max_intersection = compute_num_max_intersections_for(subdivisions)
-
-    image = jnp.zeros((image_height, image_width, num_max_intersection, num_voxel_assets, 4), dtype=jnp.float32)
-    index_map = jnp.zeros((image_height, image_width, num_max_intersection, 3), dtype=jnp.int32)
-
-    for coords in pixel_coords:
-        x, y = coords
-        image_part, index_map_part = render_pixel(x, y, camera_view_matrix, subdivisions)
-
-        image = image.at[x, y].set(image_part)
-        index_map = index_map.at[x, y].set(index_map_part)
-
-    return image, index_map
-
-
+@partial(jax.jit, static_argnums=1)
 def render(camera_view_matrix, subdivisions):
     pixel_coords = jnp.meshgrid(jnp.arange(image_width), jnp.arange(image_height))
     pixel_coords = jnp.stack(pixel_coords, axis=-1).reshape(-1, 2)
@@ -423,7 +404,18 @@ def render(camera_view_matrix, subdivisions):
         return render_pixel(coords[0], coords[1], camera_view_matrix, subdivisions)
 
     num_max_intersection = compute_num_max_intersections_for(subdivisions)
-    image, index_map = vmap(render_fn)(pixel_coords)
+    image = jnp.zeros((image_height * image_width, num_max_intersection, num_voxel_assets, 4), dtype=jnp.float32)
+    index_map = jnp.zeros((image_height * image_width, num_max_intersection, 3), dtype=jnp.int32)
+
+    def body_fn(i, val):
+        coords = pixel_coords[i]
+        image_part, index_map_part = render_fn(coords)
+        image = val[0].at[i].set(image_part)
+        index_map = val[1].at[i].set(index_map_part)
+        return image, index_map
+
+    image, index_map = lax.fori_loop(0, image_height * image_width, body_fn, (image, index_map))
+
     image = image.reshape(image_height, image_width, num_max_intersection, num_voxel_assets, 4)
     index_map = index_map.reshape(image_height, image_width, num_max_intersection, 3)
     return image, index_map
@@ -481,7 +473,7 @@ def train(camera_view_matrices, original_images, voxel_grid, num_iterations, lea
     num_views = camera_view_matrices.shape[0]
 
     for i in range(num_views):
-        cache, index_map = render(camera_view_matrices[i], get_subdivisions(voxel_grid))
+        cache, index_map = render(camera_view_matrices[i], get_subdivisions(voxel_grid).item())
         caches.append(cache)
         index_maps.append(index_map)
 
