@@ -142,10 +142,12 @@ jax_random_key = jax.random.key(0)
 
 verts, texs, faces = load_obj("models/cube.obj")
 voxel_assets = [
+    (verts, texs, faces, load_texture("models/azalea_leaves.png")),
     (jnp.zeros((0, 3)), jnp.zeros((0, 2)), jnp.zeros((0, 3, 2), dtype=jnp.int32), load_texture("models/dirt.png")),
+    # (verts, texs, faces, load_texture("models/glass.png")),
+    # (verts, texs, faces, load_texture("models/light_gray_stained_glass.png")),
     (verts, texs, faces, load_texture("models/dirt.png")),
     (verts, texs, faces, load_texture("models/cobblestone.png")),
-    (verts, texs, faces, load_texture("models/azalea_leaves.png")),
 ]
 
 num_voxel_assets = voxel_assets.__len__()
@@ -191,8 +193,6 @@ def convert_position_to_voxel_indices(position, subdivisions):
 
 
 def get_ray_origin(ray_origin, ray_direction):
-    jax.debug.print("Should not happen")
-    jax.debug.print("{x}", x=ray_origin)
     return ray_origin
 
 
@@ -249,14 +249,14 @@ def get_color_per_asset(voxel_indices, voxel_size, intersection_point, ray_direc
     intersection_point = intersection_point - ray_direction * epsilon
     voxel_local_position = jnp.clip(intersection_point - (voxel_size * voxel_indices - 0.5), 0.0, voxel_size)
 
-    #jax.debug.print("isVlaid: {c}, voxel_indices: {x}, voxel_calc: {y}, intersection_point: {z}, 🤯 {r} 🤯",
+    # jax.debug.print("isVlaid: {c}, voxel_indices: {x}, voxel_calc: {y}, intersection_point: {z}, 🤯 {r} 🤯",
     #                c=valid_grid_indices(voxel_indices, 1 / voxel_size), x=voxel_indices,
     #                y=(voxel_size * voxel_indices - 0.5), z=intersection_point, r=voxel_local_position)
 
     unit_cube_origin = (voxel_local_position / voxel_size) - 0.5
 
-    #ray_direction = jnp.zeros((3,)) - unit_cube_origin
-    #ray_direction = ray_direction / jnp.linalg.norm(ray_direction)
+    # ray_direction = jnp.zeros((3,)) - unit_cube_origin
+    # ray_direction = ray_direction / jnp.linalg.norm(ray_direction)
 
     # Move the origin slightly along the negative direction to avoid self-intersection
     unit_cube_origin = unit_cube_origin - ray_direction * epsilon
@@ -282,6 +282,7 @@ def cond_fun(carry):
     subdivisions = color_contributions_in_visited_voxels.shape[0]
     return valid_grid_indices(voxel_indices, subdivisions)
 
+
 @jit
 def ray_voxel_traversal(intersection_point, ray_direction, subdivisions, empty_contributions, empty_contribution_map):
     # Convert the intersection point to the index of the hit voxel
@@ -306,6 +307,22 @@ def ray_voxel_traversal(intersection_point, ray_direction, subdivisions, empty_c
         voxel_size / jnp.abs(ray_direction)
     )
 
+    def write_voxel_hit(color_contributions_in_visited_voxels, contributing_voxel_matrix, step_counter, voxel_indices,
+                        local_intersection_point):
+        color_contributions_in_visited_voxels = color_contributions_in_visited_voxels.at[step_counter].set(
+            lax.cond(valid_grid_indices(voxel_indices, subdivisions),
+                     lambda: get_color_per_asset(voxel_indices, voxel_size, local_intersection_point, ray_direction),
+                     lambda: jnp.zeros([num_voxel_assets, 4]),
+                     )
+        )
+        contributing_voxel_matrix = lax.cond(valid_grid_indices(voxel_indices, subdivisions),
+                                             lambda voxel_indices, step_counter: contributing_voxel_matrix.at[
+                                                 step_counter].set(voxel_indices),
+                                             lambda voxel_indices, step_counter: contributing_voxel_matrix,
+                                             voxel_indices, step_counter
+                                             )
+        return color_contributions_in_visited_voxels, contributing_voxel_matrix
+
     def body_fun(carry):
         voxel_indices, t_max, step_counter, color_contributions_in_visited_voxels, contributing_voxel_matrix = carry
 
@@ -317,19 +334,10 @@ def ray_voxel_traversal(intersection_point, ray_direction, subdivisions, empty_c
 
         t_max = t_max.at[axis].add(t_delta[axis])
 
-        color_contributions_in_visited_voxels = color_contributions_in_visited_voxels.at[step_counter].set(
-            lax.cond(valid_grid_indices(voxel_indices, subdivisions),
-                     lambda: get_color_per_asset(voxel_indices, voxel_size, local_intersection_point, ray_direction),
-                     lambda: jnp.zeros([num_voxel_assets, 4]),
-                     )
+        color_contributions_in_visited_voxels, contributing_voxel_matrix = write_voxel_hit(
+            color_contributions_in_visited_voxels, contributing_voxel_matrix, step_counter, voxel_indices,
+            local_intersection_point
         )
-
-        contributing_voxel_matrix = lax.cond(valid_grid_indices(voxel_indices, subdivisions),
-                                             lambda voxel_indices, step_counter: contributing_voxel_matrix.at[
-                                                 step_counter].set(voxel_indices),
-                                             lambda voxel_indices, step_counter: contributing_voxel_matrix,
-                                             voxel_indices, step_counter
-                                             )
 
         step_counter += 1
 
@@ -338,7 +346,12 @@ def ray_voxel_traversal(intersection_point, ray_direction, subdivisions, empty_c
     # Initialize the carry variables
     color_contributions_in_visited_voxels = empty_contributions
     contributing_voxel_matrix = empty_contribution_map
-    step_counter = 0
+
+    # process initial intersection
+    color_contributions_in_visited_voxels, contributing_voxel_matrix = write_voxel_hit(
+        color_contributions_in_visited_voxels, contributing_voxel_matrix, 0, voxel_indices, intersection_point)
+
+    step_counter = 1
     carry = (voxel_indices, t_max, step_counter, color_contributions_in_visited_voxels, contributing_voxel_matrix)
 
     # Run the while loop using lax.while_loop
@@ -381,6 +394,25 @@ def render_pixel(x, y, camera_view_matrix, subdivisions):
 
 def get_num_voxels(subdivisions):
     return subdivisions ** 3
+
+
+def render(camera_view_matrix, subdivisions):
+    pixel_coords = jnp.meshgrid(jnp.arange(image_width), jnp.arange(image_height))
+    pixel_coords = jnp.stack(pixel_coords, axis=-1).reshape(-1, 2)
+
+    num_max_intersection = compute_num_max_intersections_for(subdivisions)
+
+    image = jnp.zeros((image_height, image_width, num_max_intersection, num_voxel_assets, 4), dtype=jnp.float32)
+    index_map = jnp.zeros((image_height, image_width, num_max_intersection, 3), dtype=jnp.int32)
+
+    for coords in pixel_coords:
+        x, y = coords
+        image_part, index_map_part = render_pixel(x, y, camera_view_matrix, subdivisions)
+
+        image = image.at[x, y].set(image_part)
+        index_map = index_map.at[x, y].set(index_map_part)
+
+    return image, index_map
 
 
 def render(camera_view_matrix, subdivisions):
