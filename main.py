@@ -150,6 +150,7 @@ voxel_assets = [
     # (verts, texs, faces, load_texture("models/light_gray_stained_glass.png")),
     (verts, texs, faces, load_texture("models/dirt.png")),
     (verts, texs, faces, load_texture("models/cobblestone.png")),
+    (verts, texs, faces, load_texture("models/dark_prismarine.png")),
 ]
 
 num_voxel_assets = voxel_assets.__len__()
@@ -386,6 +387,7 @@ def trace_ray(ray_origin, ray_direction, subdivisions):
                     ray_voxel_traversal,
                     intersection_point, ray_direction, subdivisions, empty_contributions, empty_contribution_map)
 
+
 def render_pixel(x, y, camera_view_matrix, subdivisions):
     origin, direction = spawn_ray(x, y, camera_view_matrix)
     color = trace_ray(origin, direction, subdivisions)
@@ -394,6 +396,7 @@ def render_pixel(x, y, camera_view_matrix, subdivisions):
 
 def get_num_voxels(subdivisions):
     return subdivisions ** 3
+
 
 @partial(jax.jit, static_argnums=1)
 def render(camera_view_matrix, subdivisions):
@@ -432,15 +435,8 @@ def loss_fn(rendered_image, original_image):
     return mse
 
 
-def optimization_step(caches, index_maps, original_images, opt_state, get_params, opt_update, step):
-    print("starting gradient compiling")
-    grad_fn = jax.grad(compute_visual_loss_for, argnums=0)
-    print("starting gradient computation")
-    start_time = time.time()
+def optimization_step(grad_fn, caches, index_maps, original_images, opt_state, get_params, opt_update, step):
     voxel_grid_grad = grad_fn(get_params(opt_state), caches, index_maps, original_images)
-    end_time = time.time()
-    print(f"make_cache_to_image took {end_time - start_time:.2f} seconds")
-    print("Got Grad")
     opt_state = opt_update(step, voxel_grid_grad, opt_state)
 
     return opt_state
@@ -466,6 +462,19 @@ def get_train_batch(caches, index_maps, target_images, size: int):
     return batch_caches, batch_index_maps, batch_target_images
 
 
+def select_best_options(grid):
+    # get the indices of the maximum probability for each element
+    max_indices = jnp.argmax(grid, axis=-1)
+
+    # create a mask to select the maximum probability for each element
+    mask = jnp.eye(grid.shape[-1])[max_indices]
+
+    # set the maximum probability to a high value (e.g. 99999)
+    grid_max = grid * mask + (1 - mask) * 99999
+
+    return grid_max
+
+
 def train(camera_view_matrices, original_images, voxel_grid, num_iterations, learning_rate):
     caches = []
     index_maps = []
@@ -476,6 +485,7 @@ def train(camera_view_matrices, original_images, voxel_grid, num_iterations, lea
         cache, index_map = render(camera_view_matrices[i], get_subdivisions(voxel_grid).item())
         caches.append(cache)
         index_maps.append(index_map)
+        print(f'{i+1}/{num_views}')
 
     caches = jnp.stack(caches, axis=0)
     index_maps = jnp.stack(index_maps, axis=0)
@@ -483,14 +493,21 @@ def train(camera_view_matrices, original_images, voxel_grid, num_iterations, lea
     opt_init, opt_update, get_params = optimizers.adam(learning_rate)
     opt_state = opt_init(voxel_grid)
 
+    grad_fn = jax.jit(jax.grad(compute_visual_loss_for, argnums=0))
+
     for step in range(num_iterations):
         batch_caches, batch_index_maps, batch_target_images = get_train_batch(caches, index_maps, original_images, 4)
 
-        opt_state = optimization_step(batch_caches, batch_index_maps, batch_target_images, opt_state, get_params,
+        start = time.time()
+        opt_state = optimization_step(grad_fn, batch_caches, batch_index_maps, batch_target_images, opt_state,
+                                      get_params,
                                       opt_update, step)
+        end = time.time()
+        print(f'step took: {end - start}')
 
         if step % 10 == 0:
-            rendered_images = make_cache_to_image(batch_caches[:1], batch_index_maps[:1], get_params(opt_state))
+            grid_max = select_best_options(get_params(opt_state))
+            rendered_images = make_cache_to_image(batch_caches[:1], batch_index_maps[:1], grid_max)
             show_visual_comparison(batch_target_images[0], rendered_images[0])
 
     return voxel_grid
@@ -554,6 +571,7 @@ def compute_final_color(colors):
     return lax.fori_loop(0, colors.shape[0], lambda i, final_color: blend(final_color, colors[i]), final_color)[:3]
 
 
+@jit
 def make_cache_to_image(caches, index_maps, voxel_grid):
     batch_size, image_width, image_height, max_num_intersections, num_options, _ = caches.shape
 
@@ -605,7 +623,7 @@ def handle_builder_request():
     camera_matrices = jnp.stack(camera_matrices, axis=0)
     target_images = jnp.stack(target_images, axis=0)
 
-    train(camera_matrices, target_images, voxel_grid, 200, 0.5)
+    train(camera_matrices, target_images, voxel_grid, 1000, 0.1)
 
     return jsonify({'message': 'Data received successfully'})
 
