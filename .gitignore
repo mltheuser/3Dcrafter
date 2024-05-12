@@ -1,0 +1,26 @@
+# .gitignore
+
+# Ignore IntelliJ IDE files
+.idea/
+
+# Ignore Visual Studio files
+.vscode/
+
+# Ignore Svelte build files
+public/build/
+
+# Ignore Python build and cache files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.pyc
+
+# Ignore Python virtual environment
+venv/
+
+# Ignore Node modules
+node_modules/
+
+# Ignore macOS system files
+.DS_Store
