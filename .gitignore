@@ -2,6 +2,7 @@
 
 # Ignore IntelliJ IDE files
 .idea/
+*.iml
 
 # Ignore Visual Studio files
 .vscode/
