@@ -145,12 +145,13 @@ jax_random_key = jax.random.key(0)
 verts, texs, faces = load_obj("models/cube.obj")
 voxel_assets = [
     (verts, texs, faces, load_texture("models/azalea_leaves.png")),
-    (jnp.zeros((0, 3)), jnp.zeros((0, 2)), jnp.zeros((0, 3, 2), dtype=jnp.int32), load_texture("models/dirt.png")),
-    # (verts, texs, faces, load_texture("models/glass.png")),
+    (verts, texs, faces, load_texture("models/glass.png")),
     # (verts, texs, faces, load_texture("models/light_gray_stained_glass.png")),
     (verts, texs, faces, load_texture("models/dirt.png")),
     (verts, texs, faces, load_texture("models/cobblestone.png")),
     (verts, texs, faces, load_texture("models/dark_prismarine.png")),
+    # Need keep this as the last element
+    (jnp.zeros((0, 3)), jnp.zeros((0, 2)), jnp.zeros((0, 3, 2), dtype=jnp.int32), load_texture("models/dirt.png")),
 ]
 
 num_voxel_assets = voxel_assets.__len__()
@@ -470,7 +471,7 @@ def select_best_options(grid):
     mask = jnp.eye(grid.shape[-1])[max_indices]
 
     # set the maximum probability to a high value (e.g. 99999)
-    grid_max = grid * mask + (1 - mask) * 99999
+    grid_max = mask * 99999
 
     return grid_max
 
@@ -517,7 +518,7 @@ app = Flask(__name__)
 CORS(app)
 
 
-def transform_initial_voxel_grid(voxel_grid, sigma=10.0):
+def transform_initial_voxel_grid(voxel_grid, last_asset_bias=5.0):
     # Check assumptions
     assert voxel_grid.ndim == 3, "Input voxel grid must be a 3D array"
     assert voxel_grid.dtype == bool, "Input voxel grid must be a bool array"
@@ -525,7 +526,12 @@ def transform_initial_voxel_grid(voxel_grid, sigma=10.0):
     assert voxel_grid.shape[1] == n and voxel_grid.shape[2] == n, "Input voxel grid must be a cube"
 
     # Generate random Gaussian matrix B
-    B = jax.random.uniform(jax_random_key, (n, n, n, num_voxel_assets), dtype=jnp.float32)
+    B = 0.5 + jax.random.uniform(jax_random_key, (n, n, n, num_voxel_assets), dtype=jnp.float32) * 0.5
+
+    # make the last voxel asset have prob logits that are much higher than the rest while not so high that backpropagation through a softmax function is hard.
+    B = B.at[..., -1].add(last_asset_bias)
+
+    # test = jax.nn.softmax(B, axis=-1)
 
     return B
 
