@@ -86,6 +86,8 @@
 
 		new BABYLON.HemisphericLight('light1', new BABYLON.Vector3(0, 1, 0), scene);
 
+		createVoxelizedVersion(scene, subdivisions)
+
 		engine.runRenderLoop(() => {
 			scene.render();
 		});
@@ -196,8 +198,10 @@
 	let screenshotData: any[] = [];
 
 	function makeScreenshot() {
-		voxelRoot.visibility = 0.0;
-		voxelRoot.getChildren().forEach((m) => ((m as BABYLON.Mesh).visibility = 0.0));
+		if (voxelRoot) {
+			voxelRoot.visibility = 0.0;
+			voxelRoot.getChildren().forEach((m) => ((m as BABYLON.Mesh).visibility = 0.0));
+		}
 
 		BABYLON.Tools.CreateScreenshot(engine, camera, { width: 512, height: 512 }, (data: string) => {
 			
@@ -218,8 +222,10 @@
 				}
 			];
 
-			voxelRoot.visibility = 1.0;
-			voxelRoot.getChildren().forEach((m) => ((m as BABYLON.Mesh).visibility = 1.0));
+			if (voxelRoot) {
+				voxelRoot.visibility = 1.0;
+				voxelRoot.getChildren().forEach((m) => ((m as BABYLON.Mesh).visibility = 1.0));
+			}
 		});
 	}
 
