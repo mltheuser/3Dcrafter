@@ -56,8 +56,9 @@ def load_texture(file_path):
 epsilon = 1e-6
 
 
-def find_intersections(ray_origin, ray_direction, vertices, texture_coords, faces, texture):
-    intersection_colors_with_distance = jnp.zeros((faces.shape[0], 4 + 1), dtype=jnp.float32)
+def find_intersections(ray_origin, ray_direction, vertices, texture_coords, faces, possible_textures):
+    intersection_colors_with_distance = jnp.zeros((faces.shape[0], possible_textures.shape[0] * 4 + 1),
+                                                  dtype=jnp.float32)
 
     def append_intersection(i, t, u, v, face):
         # Get texture coordinates of the intersection point
@@ -65,13 +66,16 @@ def find_intersections(ray_origin, ray_direction, vertices, texture_coords, face
         barycentric_coords = jnp.array([1 - u - v, u, v])
         interpolated_uv = jnp.sum(uv * barycentric_coords[:, None], axis=0)
 
-        # Get color from the texture using nearest neighbor interpolation
-        tex_h, tex_w = texture.shape[:2]
-        tex_x = jnp.clip(jnp.round(interpolated_uv[0] * (tex_w - 1)), 0, tex_w - 1).astype(int)
-        tex_y = jnp.clip(jnp.round(interpolated_uv[1] * (tex_h - 1)), 0, tex_h - 1).astype(int)
-        color = texture[tex_y, tex_x]
+        color_with_distance = jnp.expand_dims(t, axis=0)
 
-        color_with_distance = jnp.concatenate([color, jnp.expand_dims(t, axis=0)], axis=0)
+        # Get color from the texture using nearest neighbor interpolation
+        for texture in possible_textures:
+            tex_h, tex_w = texture.shape[:2]
+            tex_x = jnp.clip(jnp.round(interpolated_uv[0] * (tex_w - 1)), 0, tex_w - 1).astype(int)
+            tex_y = jnp.clip(jnp.round(interpolated_uv[1] * (tex_h - 1)), 0, tex_h - 1).astype(int)
+            color = texture[tex_y, tex_x]
+
+            color_with_distance = jnp.concatenate([color, color_with_distance], axis=0)
 
         return intersection_colors_with_distance.at[i].set(color_with_distance)
 
@@ -117,41 +121,51 @@ def find_intersections(ray_origin, ray_direction, vertices, texture_coords, face
 
 
 @jit
-def get_ray_colour(ray_origin, ray_direction, vertices, texture_coords, faces, texture):
+def get_ray_colour(ray_origin, ray_direction, vertices, texture_coords, faces, possible_textures):
     # Find intersection points with triangles
     intersection_colors_with_distance = find_intersections(
-        ray_origin, ray_direction, vertices, texture_coords, faces, texture
+        ray_origin, ray_direction, vertices, texture_coords, faces, possible_textures
     )
 
     # Sort colors by distance
     distances = intersection_colors_with_distance[:, -1]
+    intersection_colors_per_texture = intersection_colors_with_distance[:, :-1].reshape(
+        (faces.shape[0], possible_textures.shape[0], 4))
     indices = jnp.argsort(distances)
-    sorted_colors = intersection_colors_with_distance[indices]
+    sorted_colors_per_texture = intersection_colors_per_texture[indices]
 
-    # Blend colors using alpha channel
-    blended_color = jnp.zeros(4)
+    # Apply compute_final_color to each batch element
+    transparency_factors = jnp.cumprod(1.0 - sorted_colors_per_texture[:-1, :, 3:], axis=0)
+    transparency_factors = jnp.concatenate(
+        [jnp.ones((1, possible_textures.shape[0], 1)), transparency_factors], axis=0)
 
-    for color in sorted_colors:
-        blended_color = blend(blended_color, color[:-1])  # exclude distance from blending
+    opacity_factors = sorted_colors_per_texture[..., 3:] * transparency_factors
 
-    return blended_color
+    # Compute the weighted sum of colors and alpha values
+    final_colors = jnp.sum(sorted_colors_per_texture * opacity_factors, axis=0)
+
+    final_colors = final_colors.reshape(possible_textures.shape[0], 4)
+
+    return final_colors
 
 
-image_width = 512
-image_height = 512
+image_width = 200
+image_height = 200
 
 jax_random_key = jax.random.key(0)
 
-verts, texs, faces = load_obj("models/cube.obj")
+air = (jnp.zeros((0, 3)), jnp.zeros((0, 2)), jnp.zeros((0, 3, 2), dtype=jnp.int32))
+cube = load_obj("models/cube.obj")
+
 voxel_assets = [
-    (verts, texs, faces, load_texture("models/azalea_leaves.png")),
-    (verts, texs, faces, load_texture("models/glass.png")),
-    # (verts, texs, faces, load_texture("models/light_gray_stained_glass.png")),
-    (verts, texs, faces, load_texture("models/dirt.png")),
-    (verts, texs, faces, load_texture("models/cobblestone.png")),
-    (verts, texs, faces, load_texture("models/dark_prismarine.png")),
-    # Need keep this as the last element
-    (jnp.zeros((0, 3)), jnp.zeros((0, 2)), jnp.zeros((0, 3, 2), dtype=jnp.int32), load_texture("models/dirt.png")),
+    (cube, load_texture("models/azalea_leaves.png")),
+    # (cube, load_texture("models/glass.png")),
+    # (cube, load_texture("models/light_gray_stained_glass.png")),
+    (cube, load_texture("models/dirt.png")),
+    (cube, load_texture("models/cobblestone.png")),
+    (cube, load_texture("models/dark_prismarine.png")),
+
+    (air, load_texture("models/dirt.png")),
 ]
 
 num_voxel_assets = voxel_assets.__len__()
@@ -239,6 +253,32 @@ def get_subdivisions(voxel_grid):
     return jnp.int32(voxel_grid.shape[0])
 
 
+def get_model_groups():
+    model_groups = []
+
+    for element in voxel_assets:
+        model_tuple, texture = element
+
+        i = 0
+        while i < len(model_groups):
+            if jnp.array_equal(model_groups[i][0][0], model_tuple[0]):
+                break
+            i += 1
+
+        if i >= len(model_groups):
+            model_groups.append([model_tuple, [texture]])
+        else:
+            model_groups[i][1].append(texture)
+
+    for model_group in model_groups:
+        model_group[1] = jnp.stack(model_group[1])
+
+    return model_groups
+
+
+model_groups = get_model_groups()
+
+
 def get_color_per_asset(voxel_indices, voxel_size, intersection_point, ray_direction):
     # Return the color contribution for the asset at the given voxel indices
     # using the intersection point and ray direction
@@ -253,26 +293,21 @@ def get_color_per_asset(voxel_indices, voxel_size, intersection_point, ray_direc
     intersection_point = intersection_point - ray_direction * epsilon
     voxel_local_position = jnp.clip(intersection_point - (voxel_size * voxel_indices - 0.5), 0.0, voxel_size)
 
-    #jax.debug.print("isVlaid: {c}, voxel_indices: {x}, voxel_calc: {y}, intersection_point: {z}, 🤯 {r} 🤯",
-    #                c=valid_grid_indices(voxel_indices, 1 / voxel_size), x=voxel_indices,
-    #                y=(voxel_size * voxel_indices - 0.5), z=intersection_point, r=voxel_local_position)
-
     unit_cube_origin = (voxel_local_position / voxel_size) - 0.5
-
-    # ray_direction = jnp.zeros((3,)) - unit_cube_origin
-    # ray_direction = ray_direction / jnp.linalg.norm(ray_direction)
 
     # Move the origin slightly along the negative direction to avoid self-intersection
     unit_cube_origin = unit_cube_origin - ray_direction * epsilon
 
-    asset_colors = jnp.zeros((num_voxel_assets, 4))
+    asset_colors = jnp.zeros((0, 4))
 
-    for i in range(num_voxel_assets):
-        vertices, texture_coords, faces, texture_image = voxel_assets[i]
+    for model_group in model_groups:
+        model_tuple, possible_textures = model_group
 
-        colour = get_ray_colour(unit_cube_origin, ray_direction, vertices, texture_coords, faces, texture_image)
+        vertices, texture_coords, faces = model_tuple
 
-        asset_colors = asset_colors.at[i].set(colour)
+        colours = get_ray_colour(unit_cube_origin, ray_direction, vertices, texture_coords, faces, possible_textures)
+
+        asset_colors = jnp.concatenate([asset_colors, colours], axis=0)
 
     return asset_colors
 
@@ -435,16 +470,27 @@ def loss_fn(rendered_image, original_image):
 
     return mse
 
+def temperature_annealing(epoch, warmup_epochs, initial_temperature, final_temperature, num_epochs):
+    if epoch < warmup_epochs:
+        # Warmup phase: linearly increase temperature from initial to peak value
+        peak_temperature = initial_temperature * (final_temperature / initial_temperature) ** (warmup_epochs / num_epochs)
+        current_temperature = initial_temperature + (peak_temperature - initial_temperature) * (epoch / warmup_epochs)
+    else:
+        # Exponential decay phase: decay temperature exponentially from peak to final value
+        current_temperature = initial_temperature * (final_temperature / initial_temperature) ** ((epoch - warmup_epochs) / (num_epochs - warmup_epochs))
 
-def optimization_step(grad_fn, caches, index_maps, original_images, opt_state, get_params, opt_update, step):
-    voxel_grid_grad = grad_fn(get_params(opt_state), caches, index_maps, original_images)
+    return current_temperature
+
+def optimization_step(grad_fn, caches, index_maps, original_images, opt_state, get_params, opt_update, step,
+                      temperature):
+    voxel_grid_grad = grad_fn(get_params(opt_state), caches, index_maps, original_images, temperature)
     opt_state = opt_update(step, voxel_grid_grad, opt_state)
 
     return opt_state
 
 
-def compute_visual_loss_for(voxel_grid, caches, index_maps, original_images):
-    rendered_images = make_cache_to_image(caches, index_maps, voxel_grid)
+def compute_visual_loss_for(voxel_grid, caches, index_maps, original_images, temperature):
+    rendered_images = make_cache_to_image(caches, index_maps, voxel_grid, temperature)
     loss = loss_fn(rendered_images, original_images)
     return loss
 
@@ -463,19 +509,6 @@ def get_train_batch(caches, index_maps, target_images, size: int):
     return batch_caches, batch_index_maps, batch_target_images
 
 
-def select_best_options(grid):
-    # get the indices of the maximum probability for each element
-    max_indices = jnp.argmax(grid, axis=-1)
-
-    # create a mask to select the maximum probability for each element
-    mask = jnp.eye(grid.shape[-1])[max_indices]
-
-    # set the maximum probability to a high value (e.g. 99999)
-    grid_max = mask * 99999
-
-    return grid_max
-
-
 def train(camera_view_matrices, original_images, voxel_grid, num_iterations, learning_rate):
     caches = []
     index_maps = []
@@ -486,7 +519,7 @@ def train(camera_view_matrices, original_images, voxel_grid, num_iterations, lea
         cache, index_map = render(camera_view_matrices[i], get_subdivisions(voxel_grid).item())
         caches.append(cache)
         index_maps.append(index_map)
-        print(f'{i+1}/{num_views}')
+        print(f'{i + 1}/{num_views}')
 
     caches = jnp.stack(caches, axis=0)
     index_maps = jnp.stack(index_maps, axis=0)
@@ -497,19 +530,26 @@ def train(camera_view_matrices, original_images, voxel_grid, num_iterations, lea
     grad_fn = jax.jit(jax.grad(compute_visual_loss_for, argnums=0))
 
     for step in range(num_iterations):
-        batch_caches, batch_index_maps, batch_target_images = get_train_batch(caches, index_maps, original_images, 4)
+        batch_caches, batch_index_maps, batch_target_images = get_train_batch(caches, index_maps, original_images, 6)
+
+        temperature = temperature_annealing(step, 50, 1.0, 0.005, num_iterations)
 
         start = time.time()
         opt_state = optimization_step(grad_fn, batch_caches, batch_index_maps, batch_target_images, opt_state,
                                       get_params,
-                                      opt_update, step)
+                                      opt_update, step, temperature)
         end = time.time()
-        print(f'step took: {end - start}')
+        # print(f'step took: {end - start}')
 
-        if step % 10 == 0:
-            grid_max = select_best_options(get_params(opt_state))
-            rendered_images = make_cache_to_image(batch_caches[:1], batch_index_maps[:1], grid_max)
-            show_visual_comparison(batch_target_images[0], rendered_images[0])
+        if step % 20 == 0:
+            print(f'step {step}/{num_iterations}: temperature={temperature};')
+            rendered_images = make_cache_to_image(batch_caches[:1], batch_index_maps[:1], get_params(opt_state),
+                                                  temperature)
+            rendered_images_greedy = make_cache_to_image(batch_caches[:1], batch_index_maps[:1], get_params(opt_state),
+                                                         0.0)
+            show_visual_comparison(
+                [("Original", batch_target_images[0]), (f'Learned temperature={temperature}', rendered_images[0]),
+                 (f'Learned temperature=0', rendered_images_greedy[0])])
 
     return voxel_grid
 
@@ -531,24 +571,20 @@ def transform_initial_voxel_grid(voxel_grid, last_asset_bias=5.0):
     # make the last voxel asset have prob logits that are much higher than the rest while not so high that backpropagation through a softmax function is hard.
     B = B.at[..., -1].add(last_asset_bias)
 
-    # test = jax.nn.softmax(B, axis=-1)
+    # test = gumble_softmax(B, 1.0)
 
     return B
 
 
-def show_visual_comparison(original_image, rendered_image):
+def show_visual_comparison(image_tuples):
     # Display original image with rendered image overlay, and rendered image separately
-    fig, axs = plt.subplots(1, 2, figsize=(10, 5))  # Adjust the figsize as needed
+    fig, axs = plt.subplots(1, len(image_tuples), figsize=(10, 5))  # Adjust the figsize as needed
 
-    # Plot the original image
-    axs[0].imshow(original_image)
-    axs[0].axis('off')
-    axs[0].set_title('Original Image with Rendered Overlay')
-
-    # Plot the rendered image without transparency
-    axs[1].imshow(rendered_image)
-    axs[1].axis('off')
-    axs[1].set_title('Rendered Image')
+    for i in range(len(image_tuples)):
+        image_label, image = image_tuples[i]
+        axs[i].imshow(image)
+        axs[i].axis('off')
+        axs[i].set_title(image_label)
 
     plt.tight_layout()  # Adjust the spacing between subplots
     plt.show()
@@ -577,8 +613,15 @@ def compute_final_color(colors):
     return lax.fori_loop(0, colors.shape[0], lambda i, final_color: blend(final_color, colors[i]), final_color)[:3]
 
 
+def gumble_softmax(logits, temperature):
+    gumbel_noise = jax.random.gumbel(jax_random_key, shape=logits.shape)
+    probs = jax.nn.softmax((logits + gumbel_noise) / (temperature + epsilon), axis=-1)
+
+    return probs
+
+
 @jit
-def make_cache_to_image(caches, index_maps, voxel_grid):
+def make_cache_to_image(caches, index_maps, voxel_grid, temperature):
     batch_size, image_width, image_height, max_num_intersections, num_options, _ = caches.shape
 
     # Create a mask for valid voxel indices
@@ -586,18 +629,26 @@ def make_cache_to_image(caches, index_maps, voxel_grid):
 
     # Gather the voxel probabilities based on the index map
     voxel_indices = jnp.where(valid_mask[..., None], index_maps, 0)
-    # apply softmax
+
+    # Apply Gumbel-Softmax
     voxel_logits = voxel_grid[voxel_indices[..., 0], voxel_indices[..., 1], voxel_indices[..., 2]]
-    voxel_probs = jax.nn.softmax(voxel_logits, axis=-1)
+    voxel_probs = gumble_softmax(voxel_logits, temperature)
 
     # Compute the weighted sum of asset colors
     weighted_sum = jnp.sum(caches * voxel_probs[..., None], axis=-2)
     weighted_sum = weighted_sum.reshape(batch_size * image_width * image_height, -1, 4)
 
     # Apply compute_final_color to each batch element
-    images = jax.vmap(compute_final_color)(weighted_sum)
+    transparency_factors = jnp.cumprod(1.0 - weighted_sum[..., :-1, 3:], axis=-2)
+    transparency_factors = jnp.concatenate(
+        [jnp.ones((batch_size * image_width * image_height, 1, 1)), transparency_factors], axis=-2)
 
-    images = images.reshape(batch_size, image_width, image_height, 3)
+    opacity_factors = weighted_sum[..., 3:] * transparency_factors
+
+    # Compute the weighted sum of colors and alpha values
+    final_color = jnp.sum(weighted_sum[..., :3] * opacity_factors, axis=-2)
+
+    images = final_color.reshape(batch_size, image_width, image_height, 3)
 
     return images
 
@@ -629,7 +680,7 @@ def handle_builder_request():
     camera_matrices = jnp.stack(camera_matrices, axis=0)
     target_images = jnp.stack(target_images, axis=0)
 
-    train(camera_matrices, target_images, voxel_grid, 1000, 0.1)
+    train(camera_matrices, target_images, voxel_grid, 2000, 0.05)
 
     return jsonify({'message': 'Data received successfully'})
 
@@ -640,9 +691,9 @@ def render_block(camera_view_matrix):
 
     def render_fn(coords):
         origin, direction = spawn_ray(coords[0], coords[1], camera_view_matrix)
-        colour = get_ray_colour(origin, direction, voxel_assets[0][0], voxel_assets[0][1], voxel_assets[0][2],
-                                voxel_assets[0][3])
-        return colour
+        colours = get_ray_colour(origin, direction, voxel_assets[0][0][0], voxel_assets[0][0][1], voxel_assets[0][0][2],
+                                 jnp.expand_dims(voxel_assets[0][1], axis=0))
+        return colours[0]
 
     image = vmap(render_fn)(pixel_coords)
     image = image.reshape(image_height, image_width, 4)
