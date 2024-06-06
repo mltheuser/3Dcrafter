@@ -70,7 +70,7 @@
 		scene = new BABYLON.Scene(engine);
 
 		// Set the background color to black
-		scene.clearColor = new BABYLON.Color4(0, 0, 0, 1);
+		scene.clearColor = new BABYLON.Color4(0, 0, 0, 0);
 
 		camera = new BABYLON.ArcRotateCamera(
 			'camera1',
@@ -203,7 +203,7 @@
 			voxelRoot.getChildren().forEach((m) => ((m as BABYLON.Mesh).visibility = 0.0));
 		}
 
-		BABYLON.Tools.CreateScreenshot(engine, camera, { width: 512, height: 512 }, (data: string) => {
+		BABYLON.Tools.CreateScreenshot(engine, camera, { width: 200, height: 200 }, (data: string) => {
 			
 			camera.computeWorldMatrix()
 

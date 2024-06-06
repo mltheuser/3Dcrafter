@@ -56,7 +56,6 @@ declare module '$env/static/private' {
 	export const __CF_USER_TEXT_ENCODING: string;
 	export const npm_execpath: string;
 	export const npm_config_cafile: string;
-	export const VIRTUAL_ENV: string;
 	export const ING_ADO_TOKEN: string;
 	export const MAVEN_OPTS: string;
 	export const _CE_CONDA: string;
@@ -161,7 +160,6 @@ declare module '$env/dynamic/private' {
 		__CF_USER_TEXT_ENCODING: string;
 		npm_execpath: string;
 		npm_config_cafile: string;
-		VIRTUAL_ENV: string;
 		ING_ADO_TOKEN: string;
 		MAVEN_OPTS: string;
 		_CE_CONDA: string;

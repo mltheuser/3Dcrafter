@@ -7,51 +7,16 @@ from functools import partial
 
 import jax
 import jax.numpy as jnp
-from PIL import Image
 from flask import Flask, request, jsonify
 from flask_cors import CORS
+from flaxmodels import VGG16
 from jax import lax, vmap, jit
 from jax.example_libraries import optimizers
 from matplotlib import pyplot as plt, image as mpimg
 
+from asset_lib import voxel_assets
+
 print(jax.version)
-
-
-def load_obj(file_path):
-    vertices = []
-    texture_coords = []
-    faces = []
-
-    with open(file_path, 'r') as file:
-        for line in file:
-            if line.startswith('v '):
-                vertex = [float(x) for x in line.split()[1:]]
-                vertices.append(vertex)
-            elif line.startswith('vt '):
-                tex_coord = [float(x) for x in line.split()[1:]]
-                texture_coords.append(tex_coord)
-            elif line.startswith('f '):
-                face = []
-                for vertex_data in line.split()[1:]:
-                    vertex_indices = vertex_data.split('/')
-                    vertex_index = int(vertex_indices[0]) - 1
-                    texture_index = int(vertex_indices[1]) - 1
-                    face.append((vertex_index, texture_index))
-                faces.append(face)
-
-    vertices = jnp.array(vertices, dtype=jnp.float32)
-    texture_coords = jnp.array(texture_coords, dtype=jnp.float32)
-    faces = jnp.array(faces, dtype=jnp.int32)
-
-    return vertices, texture_coords, faces
-
-
-def load_texture(file_path):
-    image = Image.open(file_path)
-    image = image.convert('RGBA')
-    texture = jnp.array(image, dtype=jnp.float32) / 255
-    return texture
-
 
 epsilon = 1e-6
 
@@ -153,20 +118,6 @@ image_width = 200
 image_height = 200
 
 jax_random_key = jax.random.key(0)
-
-air = (jnp.zeros((0, 3)), jnp.zeros((0, 2)), jnp.zeros((0, 3, 2), dtype=jnp.int32))
-cube = load_obj("models/cube.obj")
-
-voxel_assets = [
-    (cube, load_texture("models/azalea_leaves.png")),
-    # (cube, load_texture("models/glass.png")),
-    # (cube, load_texture("models/light_gray_stained_glass.png")),
-    (cube, load_texture("models/dirt.png")),
-    (cube, load_texture("models/cobblestone.png")),
-    (cube, load_texture("models/dark_prismarine.png")),
-
-    (air, load_texture("models/dirt.png")),
-]
 
 num_voxel_assets = voxel_assets.__len__()
 
@@ -460,38 +411,81 @@ def render(camera_view_matrix, subdivisions):
     return image, index_map
 
 
-def loss_fn(rendered_image, original_image):
-    # Compute and return the loss value between the rendered and original images
-    # Compute the squared difference between the images
-    squared_diff = jnp.square(rendered_image - original_image)
+# Load pre-trained VGG16 model
+vgg16 = VGG16(output='logits', pretrained='imagenet', include_head=False)
+params = vgg16.init(jax_random_key, jnp.zeros((1, image_width, image_height, 3), dtype=jnp.float32))
 
-    # Calculate the mean of the squared differences
-    mse = jnp.mean(squared_diff)
 
-    return mse
+# Extract features from specific layers
+@jit
+def extract_features(image, jax_random_key):
+    layers = ['conv1_2', 'conv2_2']
+
+    alphas = image[..., 3:]
+    rgb = image[..., :3]  # shape (batch_size, image_width, image_height, rgb)
+
+    random_background_rgb = jax.random.uniform(jax_random_key, (rgb.shape[0], 1, 1, 3))
+
+    perceptual_image = rgb * alphas + (1 - alphas) * random_background_rgb
+
+    features = jnp.zeros((0,))
+    _, utils = vgg16.apply(params, perceptual_image, capture_intermediates=True)
+
+    intermediates = utils['intermediates']
+
+    for layer_key in layers:
+        layer_features = intermediates[layer_key]['__call__'][0]
+        layer_features = layer_features.reshape((-1,))
+        features = jnp.concatenate([features, layer_features], axis=-1)
+
+    return features
+
+
+# Perceptual loss function
+def perceptual_loss(image_a, image_b, jax_random_key):
+    loss = jnp.mean(jnp.square(extract_features(image_a, jax_random_key) - extract_features(image_b, jax_random_key)),
+                    axis=-1)
+
+    return loss
+
+
+def alpha_loss_fun(image_a, image_b):
+    return jnp.square(image_a[..., 3] - image_b[..., 3])
+
+
+def loss_fn(rendered_image, original_image, jax_random_key):
+    perception_loss = perceptual_loss(rendered_image, original_image, jax_random_key)
+
+    return jnp.mean(perception_loss)
+
 
 def temperature_annealing(epoch, warmup_epochs, initial_temperature, final_temperature, num_epochs):
     if epoch < warmup_epochs:
-        # Warmup phase: linearly increase temperature from initial to peak value
-        peak_temperature = initial_temperature * (final_temperature / initial_temperature) ** (warmup_epochs / num_epochs)
-        current_temperature = initial_temperature + (peak_temperature - initial_temperature) * (epoch / warmup_epochs)
+        # Warmup phase:
+        current_temperature = initial_temperature
     else:
         # Exponential decay phase: decay temperature exponentially from peak to final value
-        current_temperature = initial_temperature * (final_temperature / initial_temperature) ** ((epoch - warmup_epochs) / (num_epochs - warmup_epochs))
+        current_temperature = initial_temperature * (final_temperature / initial_temperature) ** (
+                (epoch - warmup_epochs) / (num_epochs - warmup_epochs))
 
     return current_temperature
 
+
 def optimization_step(grad_fn, caches, index_maps, original_images, opt_state, get_params, opt_update, step,
                       temperature):
-    voxel_grid_grad = grad_fn(get_params(opt_state), caches, index_maps, original_images, temperature)
+    global jax_random_key
+    jax_random_key, sub_key = jax.random.split(jax_random_key)
+
+    voxel_grid_grad = grad_fn(get_params(opt_state), caches, index_maps, original_images, temperature, sub_key)
+
     opt_state = opt_update(step, voxel_grid_grad, opt_state)
 
     return opt_state
 
 
-def compute_visual_loss_for(voxel_grid, caches, index_maps, original_images, temperature):
-    rendered_images = make_cache_to_image(caches, index_maps, voxel_grid, temperature)
-    loss = loss_fn(rendered_images, original_images)
+def compute_visual_loss_for(voxel_grid, caches, index_maps, original_images, temperature, jax_random_key):
+    rendered_images = make_cache_to_image(caches, index_maps, voxel_grid, temperature, jax_random_key)
+    loss = loss_fn(rendered_images, original_images, jax_random_key)
     return loss
 
 
@@ -530,9 +524,9 @@ def train(camera_view_matrices, original_images, voxel_grid, num_iterations, lea
     grad_fn = jax.jit(jax.grad(compute_visual_loss_for, argnums=0))
 
     for step in range(num_iterations):
-        batch_caches, batch_index_maps, batch_target_images = get_train_batch(caches, index_maps, original_images, 6)
+        batch_caches, batch_index_maps, batch_target_images = get_train_batch(caches, index_maps, original_images, 4)
 
-        temperature = temperature_annealing(step, 50, 1.0, 0.005, num_iterations)
+        temperature = temperature_annealing(step, 0, 1.0, 0.1, num_iterations)
 
         start = time.time()
         opt_state = optimization_step(grad_fn, batch_caches, batch_index_maps, batch_target_images, opt_state,
@@ -541,12 +535,13 @@ def train(camera_view_matrices, original_images, voxel_grid, num_iterations, lea
         end = time.time()
         # print(f'step took: {end - start}')
 
-        if step % 20 == 0:
+        if step % 100 == 0:
             print(f'step {step}/{num_iterations}: temperature={temperature};')
             rendered_images = make_cache_to_image(batch_caches[:1], batch_index_maps[:1], get_params(opt_state),
-                                                  temperature)
+                                                  temperature, jax_random_key)
             rendered_images_greedy = make_cache_to_image(batch_caches[:1], batch_index_maps[:1], get_params(opt_state),
-                                                         0.0)
+                                                         0.0, jax_random_key)
+
             show_visual_comparison(
                 [("Original", batch_target_images[0]), (f'Learned temperature={temperature}', rendered_images[0]),
                  (f'Learned temperature=0', rendered_images_greedy[0])])
@@ -558,7 +553,7 @@ app = Flask(__name__)
 CORS(app)
 
 
-def transform_initial_voxel_grid(voxel_grid, last_asset_bias=5.0):
+def transform_initial_voxel_grid(voxel_grid, last_asset_bias=8.0):
     # Check assumptions
     assert voxel_grid.ndim == 3, "Input voxel grid must be a 3D array"
     assert voxel_grid.dtype == bool, "Input voxel grid must be a bool array"
@@ -566,12 +561,12 @@ def transform_initial_voxel_grid(voxel_grid, last_asset_bias=5.0):
     assert voxel_grid.shape[1] == n and voxel_grid.shape[2] == n, "Input voxel grid must be a cube"
 
     # Generate random Gaussian matrix B
-    B = 0.5 + jax.random.uniform(jax_random_key, (n, n, n, num_voxel_assets), dtype=jnp.float32) * 0.5
+    B = jnp.zeros((n, n, n, num_voxel_assets), dtype=jnp.float32)
 
     # make the last voxel asset have prob logits that are much higher than the rest while not so high that backpropagation through a softmax function is hard.
     B = B.at[..., -1].add(last_asset_bias)
 
-    # test = gumble_softmax(B, 1.0)
+    test = jax.nn.softmax(B, axis=-1)
 
     return B
 
@@ -590,38 +585,22 @@ def show_visual_comparison(image_tuples):
     plt.show()
 
 
-def blend(current_color, local_color):
-    # Extract the color components
-    r, g, b, a = local_color
+def gumble_softmax(logits, temperature, jax_random_key):
+    # Sample Gumbel noise
+    gumbel_noise = jax.random.gumbel(jax_random_key, logits.shape)
 
-    # Calculate the remaining alpha
-    remaining_alpha = 1.0 - current_color[3]
+    # Perturb logits with Gumbel noise and scale by temperature
+    gumbels = (logits + gumbel_noise) / temperature
 
-    # Apply the modified "over" operator
-    result_color = jnp.array([
-        r * a * remaining_alpha + current_color[0],
-        g * a * remaining_alpha + current_color[1],
-        b * a * remaining_alpha + current_color[2],
-        a * remaining_alpha + current_color[3]
-    ])
+    # Softmax to get probabilities
+    y_soft = jax.nn.softmax(gumbels, axis=-1)
 
-    return result_color
-
-
-def compute_final_color(colors):
-    final_color = jnp.array([0.0, 0.0, 0.0, 0.0])
-    return lax.fori_loop(0, colors.shape[0], lambda i, final_color: blend(final_color, colors[i]), final_color)[:3]
-
-
-def gumble_softmax(logits, temperature):
-    gumbel_noise = jax.random.gumbel(jax_random_key, shape=logits.shape)
-    probs = jax.nn.softmax((logits + gumbel_noise) / (temperature + epsilon), axis=-1)
-
-    return probs
+    return lax.cond(temperature < epsilon, lambda: jax.nn.one_hot(jnp.argmax(logits, axis=-1), logits.shape[-1]),
+                    lambda: y_soft)
 
 
 @jit
-def make_cache_to_image(caches, index_maps, voxel_grid, temperature):
+def make_cache_to_image(caches, index_maps, voxel_grid, temperature, jax_random_key):
     batch_size, image_width, image_height, max_num_intersections, num_options, _ = caches.shape
 
     # Create a mask for valid voxel indices
@@ -632,23 +611,25 @@ def make_cache_to_image(caches, index_maps, voxel_grid, temperature):
 
     # Apply Gumbel-Softmax
     voxel_logits = voxel_grid[voxel_indices[..., 0], voxel_indices[..., 1], voxel_indices[..., 2]]
-    voxel_probs = gumble_softmax(voxel_logits, temperature)
+    voxel_probs = gumble_softmax(voxel_logits, temperature, jax_random_key)
 
     # Compute the weighted sum of asset colors
     weighted_sum = jnp.sum(caches * voxel_probs[..., None], axis=-2)
     weighted_sum = weighted_sum.reshape(batch_size * image_width * image_height, -1, 4)
 
+    rgba = weighted_sum[..., :4]
+    alphas = weighted_sum[..., 3:]
+
     # Apply compute_final_color to each batch element
-    transparency_factors = jnp.cumprod(1.0 - weighted_sum[..., :-1, 3:], axis=-2)
+    transparency_factors = jnp.cumprod(1.0 - alphas[..., :-1, :], axis=-2)
     transparency_factors = jnp.concatenate(
         [jnp.ones((batch_size * image_width * image_height, 1, 1)), transparency_factors], axis=-2)
 
-    opacity_factors = weighted_sum[..., 3:] * transparency_factors
+    opacity_factors = alphas * transparency_factors
 
-    # Compute the weighted sum of colors and alpha values
-    final_color = jnp.sum(weighted_sum[..., :3] * opacity_factors, axis=-2)
+    final_rgb = jnp.sum(rgba * opacity_factors, axis=-2)
 
-    images = final_color.reshape(batch_size, image_width, image_height, 3)
+    images = final_rgb.reshape(batch_size, image_width, image_height, 4)
 
     return images
 
@@ -672,7 +653,7 @@ def handle_builder_request():
         image_bytes = base64.b64decode(image_data)
         image_buf = io.BytesIO(image_bytes)
         target_image = mpimg.imread(image_buf, format='png')
-        target_image = target_image[:, :, :3]
+        target_image = target_image[:, :, :4]
 
         camera_matrices.append(view_matrix)
         target_images.append(target_image)
@@ -680,7 +661,7 @@ def handle_builder_request():
     camera_matrices = jnp.stack(camera_matrices, axis=0)
     target_images = jnp.stack(target_images, axis=0)
 
-    train(camera_matrices, target_images, voxel_grid, 2000, 0.05)
+    train(camera_matrices, target_images, voxel_grid, 20000, 0.05)
 
     return jsonify({'message': 'Data received successfully'})
 
@@ -718,7 +699,7 @@ def render_a_block():
 
     image = render_block(camera_view_matrix)
 
-    show_visual_comparison(image, image)
+    show_visual_comparison([("Block", image), ("Block", image)])
     pass
 
 
