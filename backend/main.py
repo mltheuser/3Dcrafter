@@ -14,7 +14,7 @@ from jax import lax, vmap, jit
 from jax.example_libraries import optimizers
 from matplotlib import pyplot as plt, image as mpimg
 
-from asset_lib import voxel_assets
+from adapters.minecraft_importer import voxel_assets
 
 print(jax.version)
 
@@ -35,10 +35,10 @@ def find_intersections(ray_origin, ray_direction, vertices, texture_coords, face
 
         # Get color from the texture using nearest neighbor interpolation
         for texture in possible_textures:
-            tex_h, tex_w = texture.shape[:2]
+            tex_w, tex_h = texture.shape[:2]
             tex_x = jnp.clip(jnp.round(interpolated_uv[0] * (tex_w - 1)), 0, tex_w - 1).astype(int)
             tex_y = jnp.clip(jnp.round(interpolated_uv[1] * (tex_h - 1)), 0, tex_h - 1).astype(int)
-            color = texture[tex_y, tex_x]
+            color = texture[tex_x, tex_y]
 
             color_with_distance = jnp.concatenate([color, color_with_distance], axis=0)
 
@@ -114,8 +114,8 @@ def get_ray_colour(ray_origin, ray_direction, vertices, texture_coords, faces, p
     return final_colors
 
 
-image_width = 200
-image_height = 200
+image_width = 500
+image_height = 500
 
 jax_random_key = jax.random.key(0)
 
@@ -208,11 +208,11 @@ def get_model_groups():
     model_groups = []
 
     for element in voxel_assets:
-        model_tuple, texture = element
+        model_tuple, texture = element['model']
 
         i = 0
         while i < len(model_groups):
-            if jnp.array_equal(model_groups[i][0][0], model_tuple[0]):
+            if jnp.array_equal(model_groups[i][0][0], model_tuple[0]) and jnp.array_equal(model_groups[i][0][1], model_tuple[1]) and jnp.array_equal(model_groups[i][0][2], model_tuple[2]):
                 break
             i += 1
 
@@ -666,14 +666,16 @@ def handle_builder_request():
     return jsonify({'message': 'Data received successfully'})
 
 
-def render_block(camera_view_matrix):
+def render_block(camera_view_matrix, model):
     pixel_coords = jnp.meshgrid(jnp.arange(image_width), jnp.arange(image_height))
     pixel_coords = jnp.stack(pixel_coords, axis=-1).reshape(-1, 2)
 
+    model_tuple, texture = model
+
     def render_fn(coords):
         origin, direction = spawn_ray(coords[0], coords[1], camera_view_matrix)
-        colours = get_ray_colour(origin, direction, voxel_assets[0][0][0], voxel_assets[0][0][1], voxel_assets[0][0][2],
-                                 jnp.expand_dims(voxel_assets[0][1], axis=0))
+        colours = get_ray_colour(origin, direction, model_tuple[0], model_tuple[1], model_tuple[2],
+                                 jnp.expand_dims(texture, axis=0))
         return colours[0]
 
     image = vmap(render_fn)(pixel_coords)
@@ -697,12 +699,16 @@ def render_a_block():
         [-4.0, 1.0, 0.0, 1.0]
     ])
 
-    image = render_block(camera_view_matrix)
+    assets = voxel_assets[:4]
+    rendered_assets = []
+    for asset in assets:
+        image = render_block(camera_view_matrix, asset['model'])
+        rendered_assets.append((asset['name'], image))
 
-    show_visual_comparison([("Block", image), ("Block", image)])
+    show_visual_comparison(rendered_assets)
     pass
 
 
 if __name__ == '__main__':
-    # render_a_block()
-    app.run(port=5000)
+    render_a_block()
+    # app.run(port=5000)
