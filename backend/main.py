@@ -204,17 +204,24 @@ def get_subdivisions(voxel_grid):
     return jnp.int32(voxel_grid.shape[0])
 
 
+def is_close_match(x, y):
+    return x.shape == y.shape and jnp.all(jnp.abs(x - y) < 1e-6)
+
+
 def get_model_groups():
     model_groups = []
 
-    for element in voxel_assets:
-        model_tuple, texture = element['model']
-
+    for asset in voxel_assets:
         i = 0
         while i < len(model_groups):
-            if jnp.array_equal(model_groups[i][0][0], model_tuple[0]) and jnp.array_equal(model_groups[i][0][1], model_tuple[1]) and jnp.array_equal(model_groups[i][0][2], model_tuple[2]):
+            if (is_close_match(model_groups[i][0][0], asset['model']['vertices'])
+                    and is_close_match(model_groups[i][0][1], asset['model']['texture_coords'])
+                    and is_close_match(model_groups[i][0][2], asset['model']['faces'])):
                 break
             i += 1
+
+        model_tuple = (asset['model']['vertices'], asset['model']['texture_coords'], asset['model']['faces'])
+        texture = asset['texture']
 
         if i >= len(model_groups):
             model_groups.append([model_tuple, [texture]])
@@ -666,15 +673,13 @@ def handle_builder_request():
     return jsonify({'message': 'Data received successfully'})
 
 
-def render_block(camera_view_matrix, model):
+def render_block(camera_view_matrix, model, texture):
     pixel_coords = jnp.meshgrid(jnp.arange(image_width), jnp.arange(image_height))
     pixel_coords = jnp.stack(pixel_coords, axis=-1).reshape(-1, 2)
 
-    model_tuple, texture = model
-
     def render_fn(coords):
         origin, direction = spawn_ray(coords[0], coords[1], camera_view_matrix)
-        colours = get_ray_colour(origin, direction, model_tuple[0], model_tuple[1], model_tuple[2],
+        colours = get_ray_colour(origin, direction, model['vertices'], model['texture_coords'], model['faces'],
                                  jnp.expand_dims(texture, axis=0))
         return colours[0]
 
@@ -702,7 +707,7 @@ def render_a_block():
     assets = voxel_assets[:4]
     rendered_assets = []
     for asset in assets:
-        image = render_block(camera_view_matrix, asset['model'])
+        image = render_block(camera_view_matrix, asset['model'], asset['texture'])
         rendered_assets.append((asset['name'], image))
 
     show_visual_comparison(rendered_assets)

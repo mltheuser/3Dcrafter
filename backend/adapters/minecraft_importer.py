@@ -25,6 +25,27 @@ def get_base_path(full_path):
     return base_path
 
 
+def all_subsets(lst):
+    """
+    Returns all possible subsets of the given list.
+
+    Example:
+        >>> all_subsets([1, 2, 3])
+        [[], [1], [2], [1, 2], [3], [1, 3], [2, 3], [1, 2, 3]]
+    """
+    if not lst:
+        return [[]]  # base case: empty list has only one subset, the empty set
+
+    subsets = []
+    first_elem = lst[0]
+    rest_list = lst[1:]
+    for subset in all_subsets(rest_list):
+        subsets.append(subset)  # add the subset without the first element
+        subsets.append([first_elem] + subset)  # add the subset with the first element
+
+    return subsets
+
+
 def load_state_file(file_path: str):
     variants = []
     with open(file_path) as f:
@@ -33,23 +54,43 @@ def load_state_file(file_path: str):
         path_to_asset_dir = get_base_path(f.name)
         block_name = Path(f.name).stem
 
+        # extract variants from multiparts
+        if 'multipart' in blockstates:
+            fixed_parts = []
+            optional_parts = []
+            for part in blockstates['multipart']:
+                if 'when' in part:
+                    optional_parts.append(part)
+                else:
+                    fixed_parts.append(part)
+
+            extracted_variants = [subset + fixed_parts for subset in all_subsets(optional_parts)]
+            pass
+
         # flatten variants
         for variant_name, variant_data in blockstates['variants'].items():
             if isinstance(variant_data, list):
                 blockstates['variants'][variant_name] = variant_data[0]
 
         for variant_name, variant_data in blockstates['variants'].items():
-            model = load_model(resolve_namespace_paths(path_to_asset_dir, variant_data['model'], "models") + '.json',
-                               {})
+            textured_model = load_model(
+                resolve_namespace_paths(path_to_asset_dir, variant_data['model'], "models") + '.json',
+                {})
 
             if 'x' in variant_data:
-                model = rotate(model, variant_data['x'], 0)
+                textured_model['model']['vertices'] = rotate_vertices(textured_model['model']['vertices'],
+                                                                      variant_data['x'], axis='x',
+                                                                      origin=jnp.zeros((1, 3)), rescale=False)
+
             if 'y' in variant_data:
-                model = rotate(model, 0, variant_data['y'])
+                textured_model['model']['vertices'] = rotate_vertices(textured_model['model']['vertices'],
+                                                                      variant_data['y'], axis='y',
+                                                                      origin=jnp.zeros((1, 3)), rescale=False)
 
             variants.append({
                 "name": block_name + variant_name,
-                "model": model,
+                "model": textured_model['model'],
+                "texture": textured_model['texture'],
             })
     return variants
 
@@ -272,8 +313,6 @@ def load_model(file_path: str, parameters: dict):
                         (uv_to_y, uv_to_x), (uv_to_y, uv_from_x), (uv_from_y, uv_from_x), (uv_from_y, uv_to_x)
                     ])
 
-                    face_data['texture'] = parse_texture_value(face_data['texture'], parameters)
-
                     parameter_elements = parameters.setdefault('elements', [])
                     if element_id >= len(parameter_elements):
                         parameter_elements.append({})
@@ -291,10 +330,18 @@ def load_model(file_path: str, parameters: dict):
                 for face in element.get('faces', {}).values():
                     used_textures.add(face['texture'])
 
-            loaded_textures = {}
-            for texture_path in used_textures:
-                loaded_textures[texture_path] = load_texture(
-                    resolve_namespace_paths(get_base_path(f.name), texture_path, "textures") + '.png')
+            used_textures = sorted(used_textures)
+
+            loaded_textures = []
+            for texture_var in used_textures:
+                texture_path = parse_texture_value(texture_var, parameters)
+                loaded_textures.append(
+                    load_texture(
+                        resolve_namespace_paths(get_base_path(f.name), texture_path, "textures") + '.png')
+                )
+
+            # We currently require all textures to be of shape (16, 16, 4)
+            assert (all([tex.shape == (16, 16, 4) for tex in loaded_textures]))
 
             # Tinting
             tinted = []
@@ -302,18 +349,13 @@ def load_model(file_path: str, parameters: dict):
                 for face in element.get('faces', {}).values():
                     if 'tintindex' in face and face['texture'] not in tinted:
                         tinted.append(face['texture'])
-                        loaded_textures[face['texture']] *= (jnp.array([124, 189, 107, 255])[None, None, :] / 255)
+                        loaded_texture_index = used_textures.index(face['texture'])
+                        loaded_textures[loaded_texture_index] *= (jnp.array([124, 189, 107, 255])[None, None, :] / 255)
 
-            max_texture_height = max((img.shape[0] for img in loaded_textures.values()), default=0)
-
-            combined_texture = jnp.zeros((max_texture_height, 0, 4))
-            for texture_path in used_textures:
-                texture_img = loaded_textures[texture_path]
-                # store texture offset
-                loaded_textures[texture_path] = combined_texture.shape[1]
-
-                texture_img = jnp.pad(texture_img, [(0, max_texture_height - texture_img.shape[0]), (0, 0), (0, 0)])
-                combined_texture = jnp.concatenate([combined_texture, texture_img], axis=1)
+            combined_texture = jnp.zeros((16, len(loaded_textures) * 16, 4))
+            for tex_id, loaded_textures in enumerate(loaded_textures):
+                offset = 16 * tex_id
+                combined_texture = combined_texture.at[:, offset:offset + 16, :].set(loaded_textures)
 
             # combined_texture = jnp.broadcast_to(jnp.array([0.0, 1.0, 0.0, 1.0]), (1, 1, 4))
 
@@ -329,16 +371,22 @@ def load_model(file_path: str, parameters: dict):
                 for face in element.get('faces', {}).values():
                     vertices = jnp.unique(jnp.concatenate([vertices, face['vertices']], axis=0), axis=0)
 
-                    texture_offset = jnp.array([0, loaded_textures[face['texture']]])[None, :]
+                    tex_id = used_textures.index(face['texture'])
+                    texture_offset = jnp.array([0, 16 * tex_id])[None, :]
                     combined_texture_coords = (texture_offset + face['texture_coords'])
 
                     texture_coords = jnp.unique(jnp.concatenate([texture_coords, combined_texture_coords], axis=0),
                                                 axis=0)
                     face['texture_coords'] = combined_texture_coords
 
+            # sort texture_coords and vertices in a unique way
+            texture_coords = texture_coords[jnp.lexsort(jnp.rot90(texture_coords))]
+            vertices = vertices[jnp.lexsort(jnp.rot90(vertices))]
+
             faces = jnp.zeros((0, 3, 2), dtype=jnp.int32)
             for element in parameters.get('elements', []):
-                for face in element.get('faces', {}).values():
+                sorted_element_faces = [value for key,value in sorted(element.get('faces', {}).items(), reverse=True)]
+                for face in sorted_element_faces:
                     for triangle in face['faces']:  # shape (3, 2)
                         new_triangle = jnp.zeros((3, 2), dtype=jnp.int32)
                         for i in range(triangle.shape[0]):
@@ -366,7 +414,14 @@ def load_model(file_path: str, parameters: dict):
             tex_x = jnp.round(debugging_face_uvs[..., 0] * (tex_w - 1)).astype(int)
             tex_y = jnp.round(debugging_face_uvs[..., 1] * (tex_h - 1)).astype(int)
 
-            return (vertices, texture_coords, faces), combined_texture
+            return {
+                "model": {
+                    "vertices": vertices,
+                    "texture_coords": texture_coords,
+                    "faces": faces,
+                },
+                "texture": combined_texture,
+            }
             pass
     pass
 
@@ -374,6 +429,9 @@ def load_model(file_path: str, parameters: dict):
 air = (jnp.zeros((0, 3)), jnp.zeros((0, 2)), jnp.zeros((0, 3, 2), dtype=jnp.int32))
 
 voxel_assets = [
-    *load_state_file("data/minecraft/blockstates/brewing_stand.json"),
+    *load_state_file("data/minecraft/blockstates/oak_log.json"),
+    *load_state_file("data/minecraft/blockstates/dark_oak_log.json"),
+    *load_state_file("data/minecraft/blockstates/spruce_log.json"),
+    *load_state_file("data/minecraft/blockstates/fletching_table.json"),
     *load_state_file("data/minecraft/blockstates/air.json"),
 ]
