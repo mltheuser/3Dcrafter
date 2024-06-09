@@ -114,8 +114,8 @@ def get_ray_colour(ray_origin, ray_direction, vertices, texture_coords, faces, p
     return final_colors
 
 
-image_width = 500
-image_height = 500
+image_width = 800
+image_height = 800
 
 jax_random_key = jax.random.key(0)
 
@@ -704,7 +704,7 @@ def render_a_block():
         [-4.0, 1.0, 0.0, 1.0]
     ])
 
-    assets = voxel_assets[:4]
+    assets = voxel_assets[:3]
     rendered_assets = []
     for asset in assets:
         image = render_block(camera_view_matrix, asset['model'], asset['texture'])
