@@ -31,16 +31,19 @@ def find_intersections(ray_origin, ray_direction, vertices, texture_coords, face
         barycentric_coords = jnp.array([1 - u - v, u, v])
         interpolated_uv = jnp.sum(uv * barycentric_coords[:, None], axis=0)
 
-        color_with_distance = jnp.expand_dims(t, axis=0)
-
         # Get color from the texture using nearest neighbor interpolation
-        for texture in possible_textures:
-            tex_w, tex_h = texture.shape[:2]
-            tex_x = jnp.clip(jnp.round(interpolated_uv[0] * (tex_w - 1)), 0, tex_w - 1).astype(int)
-            tex_y = jnp.clip(jnp.round(interpolated_uv[1] * (tex_h - 1)), 0, tex_h - 1).astype(int)
-            color = texture[tex_x, tex_y]
+        tex_w, tex_h = possible_textures.shape[1:3]
+        tex_x = jnp.clip(jnp.round(interpolated_uv[0] * (tex_w - 1)), 0, tex_w - 1).astype(int)
+        tex_y = jnp.clip(jnp.round(interpolated_uv[1] * (tex_h - 1)), 0, tex_h - 1).astype(int)
 
-            color_with_distance = jnp.concatenate([color, color_with_distance], axis=0)
+        # Parallel texture lookup using JAX's vectorized operations
+        colors = possible_textures[:, tex_x, tex_y, :]
+
+        # Concatenate the colors with the distance
+        color_with_distance = jnp.concatenate([
+            jnp.reshape(colors, (-1,)),
+            jnp.expand_dims(t, axis=0)
+        ], axis=0)
 
         return intersection_colors_with_distance.at[i].set(color_with_distance)
 
@@ -114,8 +117,8 @@ def get_ray_colour(ray_origin, ray_direction, vertices, texture_coords, faces, p
     return final_colors
 
 
-image_width = 800
-image_height = 800
+image_width = 200
+image_height = 200
 
 jax_random_key = jax.random.key(0)
 
@@ -578,15 +581,38 @@ def transform_initial_voxel_grid(voxel_grid, last_asset_bias=8.0):
     return B
 
 
-def show_visual_comparison(image_tuples):
-    # Display original image with rendered image overlay, and rendered image separately
-    fig, axs = plt.subplots(1, len(image_tuples), figsize=(10, 5))  # Adjust the figsize as needed
+def show_visual_comparison(image_tuples, max_images_per_row=5):
+    num_images = len(image_tuples)
+    num_rows = (num_images + max_images_per_row - 1) // max_images_per_row
+    num_cols = min(num_images, max_images_per_row)
 
-    for i in range(len(image_tuples)):
+    fig, axs = plt.subplots(num_rows, num_cols, figsize=(num_cols * 4, num_rows * 4))  # Adjust the figsize as needed
+
+    for i in range(num_images):
         image_label, image = image_tuples[i]
-        axs[i].imshow(image)
-        axs[i].axis('off')
-        axs[i].set_title(image_label)
+        row = i // max_images_per_row
+        col = i % max_images_per_row
+
+        if num_rows > 1:
+            ax = axs[row, col]
+        else:
+            ax = axs[col]
+
+        ax.imshow(image)
+        ax.axis('off')
+        ax.set_title(image_label, fontsize=12)  # Adjust the fontsize as needed
+
+    # Remove any unused subplots
+    for i in range(num_images, num_rows * num_cols):
+        row = i // max_images_per_row
+        col = i % max_images_per_row
+
+        if num_rows > 1:
+            ax = axs[row, col]
+        else:
+            ax = axs[col]
+
+        ax.axis('off')
 
     plt.tight_layout()  # Adjust the spacing between subplots
     plt.show()
@@ -610,14 +636,8 @@ def gumble_softmax(logits, temperature, jax_random_key):
 def make_cache_to_image(caches, index_maps, voxel_grid, temperature, jax_random_key):
     batch_size, image_width, image_height, max_num_intersections, num_options, _ = caches.shape
 
-    # Create a mask for valid voxel indices
-    valid_mask = jnp.all(index_maps >= 0, axis=-1)
-
-    # Gather the voxel probabilities based on the index map
-    voxel_indices = jnp.where(valid_mask[..., None], index_maps, 0)
-
     # Apply Gumbel-Softmax
-    voxel_logits = voxel_grid[voxel_indices[..., 0], voxel_indices[..., 1], voxel_indices[..., 2]]
+    voxel_logits = voxel_grid[index_maps[..., 0], index_maps[..., 1], index_maps[..., 2]]
     voxel_probs = gumble_softmax(voxel_logits, temperature, jax_random_key)
 
     # Compute the weighted sum of asset colors
@@ -704,7 +724,7 @@ def render_a_block():
         [-4.0, 1.0, 0.0, 1.0]
     ])
 
-    assets = voxel_assets[:3]
+    assets = voxel_assets
     rendered_assets = []
     for asset in assets:
         image = render_block(camera_view_matrix, asset['model'], asset['texture'])
@@ -716,4 +736,4 @@ def render_a_block():
 
 if __name__ == '__main__':
     render_a_block()
-    # app.run(port=5000)
+    app.run(port=5000)

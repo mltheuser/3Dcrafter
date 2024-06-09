@@ -84,86 +84,6 @@ def load_state_file(file_path: str):
         if 'multipart' in blockstates:
             raise Exception("Multipart WIP")
 
-            fixed_parts = []
-            optional_parts = []
-            for part in blockstates['multipart']:
-                if 'when' in part:
-                    optional_parts.append(part)
-                else:
-                    fixed_parts.append(part)
-
-            extracted_variants = [subset + fixed_parts for subset in all_multipart_subsets(optional_parts)]
-
-            variants = []
-            for extracted_variant in extracted_variants:
-                if len(extracted_variant) == 0:
-                    continue
-
-                models = []
-                for apply_parameters in extracted_variant:
-                    textured_model = load_model_apply(path_to_asset_dir, apply_parameters['apply'])
-                    models.append(textured_model)
-
-                # combine models
-                combined_vertices = jnp.concatenate([model['model']['vertices'] for model in models], axis=0)
-
-                combined_textures = jnp.concatenate([model['texture'] for model in models], axis=1)
-
-                plt.imshow(combined_textures)
-                plt.show()
-
-                tex_x = [
-                    jnp.round(model['model']['texture_coords'][..., 0] * (model['texture'].shape[0] - 1)).astype(int)
-                    for
-                    model_id, model in enumerate(models)]
-                tex_y = [
-                    jnp.round(model['model']['texture_coords'][..., 1] * (model['texture'].shape[1] - 1)).astype(int)
-                    for
-                    model_id, model in enumerate(models)]
-
-                tex_y = [tex + tex_id * 16 for tex_id, tex in enumerate(tex_y)]
-
-                offset_texture_ids = [jnp.concatenate([t_x[:, None], t_y[:, None]], axis=-1) / (
-                        jnp.array(combined_textures.shape[:2])[None, :] - 1)
-                                      for t_x, t_y in zip(tex_x, tex_y)]
-
-                combined_tex_coords = jnp.concatenate(offset_texture_ids, axis=0)
-
-                # Now iterate over the faces and find the original things again.
-                combined_faces = jnp.zeros((0, 3, 2), dtype=jnp.int32)
-                for model_id, model in enumerate(models):
-                    for triangle in model['model']['faces']:
-                        new_triangle = jnp.zeros((3, 2), dtype=jnp.int32)
-                        for i in range(triangle.shape[0]):
-                            vertex_id, uv_id = triangle[i]
-
-                            target_vertex = model['model']['vertices'][vertex_id]
-                            target_uv_coord = offset_texture_ids[model_id][uv_id]
-
-                            # Find the indices of the target vertex and UV coordinates in the respective arrays
-                            vertex_index = jnp.where((combined_vertices == target_vertex).all(axis=1))[0][0]
-                            uv_index = jnp.where((combined_tex_coords == target_uv_coord).all(axis=1))[0][0]
-
-                            # Assign the new indices to the triangle
-                            new_triangle = new_triangle.at[i].set(jnp.array([vertex_index, uv_index]))
-
-                        # Append the new triangle to the faces array
-                        combined_faces = jnp.concatenate([combined_faces, new_triangle[None, ...]], axis=0)
-
-                variants.append({
-                    "name": block_name,
-                    "model": {
-                        'vertices': combined_vertices,
-                        'texture_coords': combined_tex_coords,
-                        'faces': combined_faces,
-                    },
-                    "texture": combined_textures,
-                })
-                pass
-
-            return variants
-            pass
-
         # flatten variants
         for variant_name, variant_data in blockstates['variants'].items():
             if isinstance(variant_data, list):
@@ -177,6 +97,7 @@ def load_state_file(file_path: str):
                 "model": textured_model['model'],
                 "texture": textured_model['texture'],
             })
+
     return variants
 
 
@@ -360,9 +281,6 @@ def load_model(file_path: str, parameters: dict):
 
                     if 'rotation' in element:
                         rotation = element['rotation']
-                        # angle in degrees
-                        # axis is x, y or z
-                        # origin is [x, y, z] pos
                         vertices = rotate_vertices(vertices, rotation['angle'], rotation['axis'],
                                                    jnp.array(rotation['origin']),
                                                    rescale='rescale' in rotation and rotation['rescale'])
@@ -381,8 +299,6 @@ def load_model(file_path: str, parameters: dict):
                                 to_pos[0], 16 - from_pos[2],
                             ])
                         elif face_orientation == 'north' or face_orientation == 'south':
-                            # 1, 8,
-                            # 14, 15
                             uv = jnp.array([
                                 from_pos[0], 16 - to_pos[1],
                                 to_pos[0], 16 - from_pos[1],
@@ -416,8 +332,6 @@ def load_model(file_path: str, parameters: dict):
             return load_model(resolve_namespace_paths(get_base_path(f.name), model['parent'], "models") + '.json',
                               parameters)
         else:
-            # ...
-
             used_textures = set()
             for element in parameters.get('elements', []):
                 for face in element.get('faces', {}).values():
@@ -500,12 +414,6 @@ def load_model(file_path: str, parameters: dict):
             vertices = vertices - 0.5
             texture_coords = texture_coords / (combined_texture_size - 1)
 
-            # just for debugging:
-            debugging_face_uvs = texture_coords[faces[..., 1]]
-            tex_w, tex_h = combined_texture.shape[:2]
-            tex_x = jnp.round(debugging_face_uvs[..., 0] * (tex_w - 1)).astype(int)
-            tex_y = jnp.round(debugging_face_uvs[..., 1] * (tex_h - 1)).astype(int)
-
             return {
                 "model": {
                     "vertices": vertices,
@@ -518,7 +426,105 @@ def load_model(file_path: str, parameters: dict):
     pass
 
 
+def load_slabs():
+    return [
+        *load_state_file("data/minecraft/blockstates/oak_slab.json"),
+        *load_state_file("data/minecraft/blockstates/spruce_slab.json"),
+        *load_state_file("data/minecraft/blockstates/birch_slab.json"),
+        *load_state_file("data/minecraft/blockstates/jungle_slab.json"),
+        *load_state_file("data/minecraft/blockstates/acacia_slab.json"),
+        *load_state_file("data/minecraft/blockstates/dark_oak_slab.json"),
+        *load_state_file("data/minecraft/blockstates/mangrove_slab.json"),
+        *load_state_file("data/minecraft/blockstates/cherry_slab.json"),
+        *load_state_file("data/minecraft/blockstates/bamboo_slab.json"),
+        *load_state_file("data/minecraft/blockstates/bamboo_mosaic_slab.json"),
+        *load_state_file("data/minecraft/blockstates/crimson_slab.json"),
+        *load_state_file("data/minecraft/blockstates/warped_slab.json"),
+        *load_state_file("data/minecraft/blockstates/stone_slab.json"),
+        *load_state_file("data/minecraft/blockstates/cobblestone_slab.json"),
+        *load_state_file("data/minecraft/blockstates/mossy_cobblestone_slab.json"),
+        *load_state_file("data/minecraft/blockstates/smooth_stone_slab.json"),
+        *load_state_file("data/minecraft/blockstates/stone_brick_slab.json"),
+        *load_state_file("data/minecraft/blockstates/mossy_stone_brick_slab.json"),
+        *load_state_file("data/minecraft/blockstates/granite_slab.json"),
+        *load_state_file("data/minecraft/blockstates/polished_granite_slab.json"),
+        *load_state_file("data/minecraft/blockstates/diorite_slab.json"),
+        *load_state_file("data/minecraft/blockstates/polished_diorite_slab.json"),
+        *load_state_file("data/minecraft/blockstates/andesite_slab.json"),
+        *load_state_file("data/minecraft/blockstates/polished_andesite_slab.json"),
+        *load_state_file("data/minecraft/blockstates/cobbled_deepslate_slab.json"),
+        *load_state_file("data/minecraft/blockstates/polished_deepslate_slab.json"),
+        *load_state_file("data/minecraft/blockstates/deepslate_brick_slab.json"),
+        *load_state_file("data/minecraft/blockstates/deepslate_tile_slab.json"),
+        *load_state_file("data/minecraft/blockstates/brick_slab.json"),
+        *load_state_file("data/minecraft/blockstates/mud_brick_slab.json"),
+        *load_state_file("data/minecraft/blockstates/sandstone_slab.json"),
+        *load_state_file("data/minecraft/blockstates/smooth_sandstone_slab.json"),
+        *load_state_file("data/minecraft/blockstates/cut_sandstone_slab.json"),
+        *load_state_file("data/minecraft/blockstates/red_sandstone_slab.json"),
+        *load_state_file("data/minecraft/blockstates/smooth_red_sandstone_slab.json"),
+        *load_state_file("data/minecraft/blockstates/cut_red_sandstone_slab.json"),
+        *load_state_file("data/minecraft/blockstates/prismarine_slab.json"),
+        *load_state_file("data/minecraft/blockstates/prismarine_brick_slab.json"),
+        *load_state_file("data/minecraft/blockstates/dark_prismarine_slab.json"),
+        *load_state_file("data/minecraft/blockstates/nether_brick_slab.json"),
+        *load_state_file("data/minecraft/blockstates/red_nether_brick_slab.json"),
+        *load_state_file("data/minecraft/blockstates/blackstone_slab.json"),
+        *load_state_file("data/minecraft/blockstates/polished_blackstone_slab.json"),
+        *load_state_file("data/minecraft/blockstates/polished_blackstone_brick_slab.json"),
+        *load_state_file("data/minecraft/blockstates/end_stone_brick_slab.json"),
+        *load_state_file("data/minecraft/blockstates/purpur_slab.json"),
+        *load_state_file("data/minecraft/blockstates/quartz_slab.json"),
+        *load_state_file("data/minecraft/blockstates/smooth_quartz_slab.json"),
+        *load_state_file("data/minecraft/blockstates/cut_copper_slab.json"),
+        *load_state_file("data/minecraft/blockstates/exposed_cut_copper_slab.json"),
+        *load_state_file("data/minecraft/blockstates/weathered_cut_copper_slab.json"),
+        *load_state_file("data/minecraft/blockstates/oxidized_cut_copper_slab.json"),
+    ]
+
+
+def load_colored_concrete():
+    return [
+        *load_state_file("data/minecraft/blockstates/white_concrete.json"),
+        *load_state_file("data/minecraft/blockstates/light_gray_concrete.json"),
+        *load_state_file("data/minecraft/blockstates/gray_concrete.json"),
+        *load_state_file("data/minecraft/blockstates/black_concrete.json"),
+        *load_state_file("data/minecraft/blockstates/brown_concrete.json"),
+        *load_state_file("data/minecraft/blockstates/red_concrete.json"),
+        *load_state_file("data/minecraft/blockstates/orange_concrete.json"),
+        *load_state_file("data/minecraft/blockstates/yellow_concrete.json"),
+        *load_state_file("data/minecraft/blockstates/lime_concrete.json"),
+        *load_state_file("data/minecraft/blockstates/green_concrete.json"),
+        *load_state_file("data/minecraft/blockstates/cyan_concrete.json"),
+        *load_state_file("data/minecraft/blockstates/light_blue_concrete.json"),
+        *load_state_file("data/minecraft/blockstates/blue_concrete.json"),
+        *load_state_file("data/minecraft/blockstates/purple_concrete.json"),
+        *load_state_file("data/minecraft/blockstates/magenta_concrete.json"),
+        *load_state_file("data/minecraft/blockstates/pink_concrete.json"),
+    ]
+
+
+def load_leaves():
+    return [
+        *load_state_file("data/minecraft/blockstates/oak_leaves.json"),
+        *load_state_file("data/minecraft/blockstates/spruce_leaves.json"),
+        *load_state_file("data/minecraft/blockstates/birch_leaves.json"),
+        *load_state_file("data/minecraft/blockstates/jungle_leaves.json"),
+        *load_state_file("data/minecraft/blockstates/acacia_leaves.json"),
+        *load_state_file("data/minecraft/blockstates/dark_oak_leaves.json"),
+        *load_state_file("data/minecraft/blockstates/mangrove_leaves.json"),
+        *load_state_file("data/minecraft/blockstates/cherry_leaves.json"),
+        *load_state_file("data/minecraft/blockstates/azalea_leaves.json"),
+        *load_state_file("data/minecraft/blockstates/flowering_azalea_leaves.json"),
+    ]
+
+
 voxel_assets = [
-    *load_state_file("data/minecraft/blockstates/green_candle_cake.json"),
+    *load_leaves(),
+
+    *load_colored_concrete(),
+
+    *load_slabs()[:10],
+
     *load_state_file("data/minecraft/blockstates/air.json"),
 ]
