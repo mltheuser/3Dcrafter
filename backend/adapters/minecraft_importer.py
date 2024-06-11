@@ -11,7 +11,7 @@ debug_combined_texture = False
 def load_texture(file_path):
     image = Image.open(file_path)
     image = image.convert('RGBA')
-    texture = jnp.array(image, dtype=jnp.float32) / 255
+    texture = jnp.array(image, dtype=jnp.uint8)
     return texture
 
 
@@ -72,6 +72,93 @@ def load_model_apply(path_to_asset_dir, parameters):
     return textured_model
 
 
+def load_multipart_block(parts, path_to_asset_dir, block_name):
+    fixed_parts = []
+    optional_parts = []
+    for part in parts:
+        if 'when' in part:
+            optional_parts.append(part)
+        else:
+            fixed_parts.append(part)
+
+    extracted_variants = [subset + fixed_parts for subset in all_multipart_subsets(optional_parts)]
+
+    variants = []
+    for extracted_variant in extracted_variants:
+        if len(extracted_variant) == 0:
+            continue
+
+        models = []
+        for apply_parameters in extracted_variant:
+            if isinstance(apply_parameters['apply'], list):
+                print("Random model selection not supported. Will take first option for now.")
+                apply_parameters['apply'] = apply_parameters['apply'][0]
+            textured_model = load_model_apply(path_to_asset_dir, apply_parameters['apply'])
+            models.append(textured_model)
+
+        # combine models
+        combined_vertices = jnp.concatenate([model['model']['vertices'] for model in models], axis=0)
+
+        # combine textures
+        tex_x = [
+            jnp.round(model['model']['texture_coords'][..., 0] * (model['texture'].shape[0] - 1)).astype(int)
+            for
+            model_id, model in enumerate(models)]
+        tex_y = [
+            jnp.round(model['model']['texture_coords'][..., 1] * (model['texture'].shape[1] - 1)).astype(int)
+            for
+            model_id, model in enumerate(models)]
+
+        textures = [model['texture'] for model in models]
+        max_tex_width = max([tex.shape[1] for tex in textures])
+        combined_textures = jnp.zeros((0, max_tex_width, 4), dtype=jnp.uint8)
+        for texture_id, texture in enumerate(textures):
+            tex_x[texture_id] += combined_textures.shape[0]
+            combined_textures = jnp.concatenate([combined_textures, texture], axis=0)
+
+        # plt.imshow(combined_textures)
+        # plt.show()
+
+        offset_tex_coords = [jnp.concatenate([t_x[:, None], t_y[:, None]], axis=-1) for t_x, t_y in zip(tex_x, tex_y)]
+        offset_tex_coords = [coords / (jnp.array(combined_textures.shape[:2])[None, :] - 1) for coords in
+                             offset_tex_coords]
+        combined_tex_coords = jnp.concatenate(offset_tex_coords, axis=0)
+
+        # Now iterate over the faces and find the original things again.
+        combined_faces = jnp.zeros((0, 3, 2), dtype=jnp.int32)
+        for model_id, model in enumerate(models):
+            for triangle in model['model']['faces']:
+                new_triangle = jnp.zeros((3, 2), dtype=jnp.int32)
+                for i in range(triangle.shape[0]):
+                    vertex_id, uv_id = triangle[i]
+
+                    target_vertex = model['model']['vertices'][vertex_id]
+                    target_uv_coord = offset_tex_coords[model_id][uv_id]
+
+                    # Find the indices of the target vertex and UV coordinates in the respective arrays
+                    vertex_index = jnp.where((combined_vertices == target_vertex).all(axis=1))[0][0]
+                    uv_index = jnp.where((combined_tex_coords == target_uv_coord).all(axis=1))[0][0]
+
+                    # Assign the new indices to the triangle
+                    new_triangle = new_triangle.at[i].set(jnp.array([vertex_index, uv_index]))
+
+                # Append the new triangle to the faces array
+                combined_faces = jnp.concatenate([combined_faces, new_triangle[None, ...]], axis=0)
+
+        variants.append({
+            "name": block_name,
+            "model": {
+                'vertices': combined_vertices,
+                'texture_coords': combined_tex_coords,
+                'faces': combined_faces,
+            },
+            "texture": combined_textures,
+        })
+        pass
+
+    return variants
+
+
 def load_state_file(file_path: str):
     variants = []
     with open(file_path) as f:
@@ -82,11 +169,12 @@ def load_state_file(file_path: str):
 
         # extract variants from multiparts
         if 'multipart' in blockstates:
-            raise Exception("Multipart WIP")
+            return load_multipart_block(blockstates['multipart'], path_to_asset_dir, block_name)
 
         # flatten variants
         for variant_name, variant_data in blockstates['variants'].items():
             if isinstance(variant_data, list):
+                print("Random model selection not supported. Will take first option for now.")
                 blockstates['variants'][variant_name] = variant_data[0]
 
         for variant_name, variant_data in blockstates['variants'].items():
@@ -294,29 +382,36 @@ def load_model(file_path: str, parameters: dict):
                     if 'uv' not in face_data:
                         # Compute the UV coordinates depending on the face orientation
                         if face_orientation == 'down' or face_orientation == 'up':
-                            uv = jnp.array([
+                            uv = [
                                 from_pos[0], 16 - to_pos[2],
                                 to_pos[0], 16 - from_pos[2],
-                            ])
+                            ]
                         elif face_orientation == 'north' or face_orientation == 'south':
-                            uv = jnp.array([
+                            uv = [
                                 from_pos[0], 16 - to_pos[1],
                                 to_pos[0], 16 - from_pos[1],
-                            ])
+                            ]
                         elif face_orientation == 'west' or face_orientation == 'east':
-                            uv = jnp.array([
+                            uv = [
                                 from_pos[2], 16 - to_pos[1],
                                 to_pos[2], 16 - from_pos[1],
-                            ])
+                            ]
                         else:
                             raise Exception("Invalid face orientation.")
 
                         face_data['uv'] = uv
 
-                    uv_from_x, uv_from_y, uv_to_x, uv_to_y = face_data['uv']
+                    uv = jnp.array(face_data['uv'])
 
-                    uv_to_x -= 1
-                    uv_to_y -= 1
+                    if uv[0] > uv[2]:
+                        raise Exception(
+                            'Tried to load model with flipped texture. See docs. This is not supported currently.')
+
+                    uv = uv - jnp.array([0, 0, 1, 1])
+
+                    assert jnp.all(uv >= 0)
+
+                    uv_from_x, uv_from_y, uv_to_x, uv_to_y = uv
 
                     face_data['texture_coords'] = jnp.array([
                         (uv_to_y, uv_to_x), (uv_to_y, uv_from_x), (uv_from_y, uv_from_x), (uv_from_y, uv_to_x)
@@ -342,10 +437,9 @@ def load_model(file_path: str, parameters: dict):
             loaded_textures = []
             for texture_var in used_textures:
                 texture_path = parse_texture_value(texture_var, parameters)
-                loaded_textures.append(
-                    load_texture(
-                        resolve_namespace_paths(get_base_path(f.name), texture_path, "textures") + '.png')
-                )
+                texture = load_texture(
+                    resolve_namespace_paths(get_base_path(f.name), texture_path, "textures") + '.png') / 255
+                loaded_textures.append(texture)
 
             # Tinting
             tinted = []
@@ -358,10 +452,13 @@ def load_model(file_path: str, parameters: dict):
 
             max_tex_height = max([tex.shape[1] for tex in loaded_textures], default=0)
 
-            combined_texture = jnp.zeros((0, max_tex_height, 4))
+            combined_texture = jnp.zeros((0, max_tex_height, 4), dtype=jnp.uint8)
             tex_offsets = [0] * len(loaded_textures)
             for tex_id, loaded_texture in enumerate(loaded_textures):
                 tex_offsets[tex_id] = combined_texture.shape[0]
+
+                loaded_texture = jnp.clip(jnp.round(loaded_texture * 255), 0, 255).astype(jnp.uint8)
+
                 combined_texture = jnp.concatenate([combined_texture, loaded_texture], axis=0)
 
             combined_texture_size = jnp.array(combined_texture.shape)[None, :2]
@@ -519,12 +616,61 @@ def load_leaves():
     ]
 
 
+def load_carpets():
+    return [
+        *load_state_file("data/minecraft/blockstates/white_carpet.json"),
+        *load_state_file("data/minecraft/blockstates/light_gray_carpet.json"),
+        *load_state_file("data/minecraft/blockstates/gray_carpet.json"),
+        *load_state_file("data/minecraft/blockstates/black_carpet.json"),
+        *load_state_file("data/minecraft/blockstates/brown_carpet.json"),
+        *load_state_file("data/minecraft/blockstates/red_carpet.json"),
+        *load_state_file("data/minecraft/blockstates/orange_carpet.json"),
+        *load_state_file("data/minecraft/blockstates/yellow_carpet.json"),
+        *load_state_file("data/minecraft/blockstates/lime_carpet.json"),
+        *load_state_file("data/minecraft/blockstates/green_carpet.json"),
+        *load_state_file("data/minecraft/blockstates/cyan_carpet.json"),
+        *load_state_file("data/minecraft/blockstates/light_blue_carpet.json"),
+        *load_state_file("data/minecraft/blockstates/blue_carpet.json"),
+        *load_state_file("data/minecraft/blockstates/purple_carpet.json"),
+        *load_state_file("data/minecraft/blockstates/magenta_carpet.json"),
+        *load_state_file("data/minecraft/blockstates/pink_carpet.json"),
+    ]
+
+
+def load_glass_blocks():
+    return [
+        *load_state_file("data/minecraft/blockstates/glass.json"),
+        *load_state_file("data/minecraft/blockstates/white_stained_glass.json"),
+        *load_state_file("data/minecraft/blockstates/light_gray_stained_glass.json"),
+        *load_state_file("data/minecraft/blockstates/gray_stained_glass.json"),
+        *load_state_file("data/minecraft/blockstates/black_stained_glass.json"),
+        *load_state_file("data/minecraft/blockstates/brown_stained_glass.json"),
+        *load_state_file("data/minecraft/blockstates/red_stained_glass.json"),
+        *load_state_file("data/minecraft/blockstates/orange_stained_glass.json"),
+        *load_state_file("data/minecraft/blockstates/yellow_stained_glass.json"),
+        *load_state_file("data/minecraft/blockstates/lime_stained_glass.json"),
+        *load_state_file("data/minecraft/blockstates/green_stained_glass.json"),
+        *load_state_file("data/minecraft/blockstates/cyan_stained_glass.json"),
+        *load_state_file("data/minecraft/blockstates/light_blue_stained_glass.json"),
+        *load_state_file("data/minecraft/blockstates/blue_stained_glass.json"),
+        *load_state_file("data/minecraft/blockstates/purple_stained_glass.json"),
+        *load_state_file("data/minecraft/blockstates/magenta_stained_glass.json"),
+        *load_state_file("data/minecraft/blockstates/pink_stained_glass.json"),
+    ]
+
+
 voxel_assets = [
-    *load_leaves(),
+    # *load_leaves(),
 
-    *load_colored_concrete(),
+    *load_state_file("data/minecraft/blockstates/honeycomb_block.json"),
 
-    *load_slabs()[:10],
+    # *load_colored_concrete(),
+
+    # *load_slabs(),
+
+    # *load_carpets(),
+
+    # *load_glass_blocks(),
 
     *load_state_file("data/minecraft/blockstates/air.json"),
 ]

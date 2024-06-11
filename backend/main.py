@@ -18,12 +18,14 @@ from adapters.minecraft_importer import voxel_assets
 
 print(jax.version)
 
+jax.config.update('jax_backend_target', 'cpu')
+
 epsilon = 1e-6
 
 
 def find_intersections(ray_origin, ray_direction, vertices, texture_coords, faces, possible_textures):
-    intersection_colors_with_distance = jnp.zeros((faces.shape[0], possible_textures.shape[0] * 4 + 1),
-                                                  dtype=jnp.float32)
+    intersection_colors = jnp.zeros((faces.shape[0], possible_textures.shape[0] * 4), dtype=jnp.uint8)
+    intersection_distances = jnp.zeros((faces.shape[0], 1), dtype=jnp.float32)
 
     def append_intersection(i, t, u, v, face):
         # Get texture coordinates of the intersection point
@@ -39,16 +41,10 @@ def find_intersections(ray_origin, ray_direction, vertices, texture_coords, face
         # Parallel texture lookup using JAX's vectorized operations
         colors = possible_textures[:, tex_x, tex_y, :]
 
-        # Concatenate the colors with the distance
-        color_with_distance = jnp.concatenate([
-            jnp.reshape(colors, (-1,)),
-            jnp.expand_dims(t, axis=0)
-        ], axis=0)
-
-        return intersection_colors_with_distance.at[i].set(color_with_distance)
+        return intersection_colors.at[i].set(jnp.reshape(colors, (-1,))), intersection_distances.at[i].set(t)
 
     def do_nothing(i, t, u, v, face):
-        return intersection_colors_with_distance
+        return intersection_colors, intersection_distances
 
     for i in range(faces.shape[0]):
         face = faces[i]
@@ -80,37 +76,40 @@ def find_intersections(ray_origin, ray_direction, vertices, texture_coords, face
         is_invalid_intersection = jnp.logical_or(is_invalid_intersection, invalid_uv)
         is_invalid_intersection = jnp.logical_or(is_invalid_intersection, invalid_t)
 
-        intersection_colors_with_distance = lax.cond(is_invalid_intersection,
-                                                     lambda _: do_nothing(i, t, u, v, face),
-                                                     lambda _: append_intersection(i, t, u, v, face),
-                                                     operand=None)
+        intersection_colors, intersection_distances = lax.cond(is_invalid_intersection,
+                    lambda _: do_nothing(i, t, u, v, face),
+                    lambda _: append_intersection(i, t, u, v, face),
+                    operand=None)
 
-    return intersection_colors_with_distance
+    return intersection_colors, intersection_distances
 
 
 @jit
 def get_ray_colour(ray_origin, ray_direction, vertices, texture_coords, faces, possible_textures):
     # Find intersection points with triangles
-    intersection_colors_with_distance = find_intersections(
+    intersection_colors, intersection_distances = find_intersections(
         ray_origin, ray_direction, vertices, texture_coords, faces, possible_textures
     )
 
     # Sort colors by distance
-    distances = intersection_colors_with_distance[:, -1]
-    intersection_colors_per_texture = intersection_colors_with_distance[:, :-1].reshape(
+    intersection_colors_per_texture = intersection_colors.reshape(
         (faces.shape[0], possible_textures.shape[0], 4))
-    indices = jnp.argsort(distances)
+    indices = jnp.argsort(intersection_distances[:, -1])
     sorted_colors_per_texture = intersection_colors_per_texture[indices]
 
+    sorted_alphas = sorted_colors_per_texture[..., 3:] / 255
+
     # Apply compute_final_color to each batch element
-    transparency_factors = jnp.cumprod(1.0 - sorted_colors_per_texture[:-1, :, 3:], axis=0)
+    transparency_factors = jnp.cumprod(1.0 - (sorted_alphas[:-1, ...]), axis=0)
     transparency_factors = jnp.concatenate(
         [jnp.ones((1, possible_textures.shape[0], 1)), transparency_factors], axis=0)
 
-    opacity_factors = sorted_colors_per_texture[..., 3:] * transparency_factors
+    opacity_factors = sorted_alphas * transparency_factors
 
     # Compute the weighted sum of colors and alpha values
     final_colors = jnp.sum(sorted_colors_per_texture * opacity_factors, axis=0)
+
+    final_colors = jnp.clip(jnp.round(final_colors), 0, 255).astype(jnp.uint8)
 
     final_colors = final_colors.reshape(possible_textures.shape[0], 4)
 
@@ -159,7 +158,7 @@ def is_inside_unit_cube(point):
 def convert_position_to_voxel_indices(position, subdivisions):
     voxel_indices = jnp.floor(
         (position + 0.5) / (1 / subdivisions)
-    ).astype(int)
+    ).astype(jnp.int32)
 
     return voxel_indices
 
@@ -259,7 +258,7 @@ def get_color_per_asset(voxel_indices, voxel_size, intersection_point, ray_direc
     # Move the origin slightly along the negative direction to avoid self-intersection
     unit_cube_origin = unit_cube_origin - ray_direction * epsilon
 
-    asset_colors = jnp.zeros((0, 4))
+    asset_colors = jnp.zeros((0, 4), dtype=jnp.uint8)
 
     for model_group in model_groups:
         model_tuple, possible_textures = model_group
@@ -290,7 +289,7 @@ def ray_voxel_traversal(intersection_point, ray_direction, subdivisions, empty_c
     voxel_size = 1 / subdivisions
 
     # Implement DDA algorithm for ray voxel traversal here:
-    step = jnp.sign(ray_direction)
+    step = jnp.sign(ray_direction).astype(voxel_indices.dtype)
 
     step_between_0_and_1 = jnp.clip(step, 0, 1)
 
@@ -311,12 +310,12 @@ def ray_voxel_traversal(intersection_point, ray_direction, subdivisions, empty_c
         color_contributions_in_visited_voxels = color_contributions_in_visited_voxels.at[step_counter].set(
             lax.cond(valid_grid_indices(voxel_indices, subdivisions),
                      lambda: get_color_per_asset(voxel_indices, voxel_size, local_intersection_point, ray_direction),
-                     lambda: jnp.zeros([num_voxel_assets, 4]),
+                     lambda: jnp.zeros([num_voxel_assets, 4], dtype=jnp.uint8),
                      )
         )
         contributing_voxel_matrix = lax.cond(valid_grid_indices(voxel_indices, subdivisions),
                                              lambda voxel_indices, step_counter: contributing_voxel_matrix.at[
-                                                 step_counter].set(voxel_indices),
+                                                 step_counter].set(voxel_indices.astype(contributing_voxel_matrix.dtype)),
                                              lambda voxel_indices, step_counter: contributing_voxel_matrix,
                                              voxel_indices, step_counter
                                              )
@@ -376,8 +375,8 @@ def trace_ray(ray_origin, ray_direction, subdivisions):
 
     num_max_intersection = compute_num_max_intersections_for(subdivisions)
 
-    empty_contributions = jnp.zeros((num_max_intersection, num_voxel_assets, 4), dtype=jnp.float16)
-    empty_contribution_map = jnp.full((num_max_intersection, 3), -1, dtype=jnp.int16)
+    empty_contributions = jnp.zeros((num_max_intersection, num_voxel_assets, 4), dtype=jnp.uint8)
+    empty_contribution_map = jnp.full((num_max_intersection, 3), 0, dtype=jnp.uint16)
 
     return lax.cond(no_intersection,
                     get_empty_contr,
@@ -404,8 +403,9 @@ def render(camera_view_matrix, subdivisions):
         return render_pixel(coords[0], coords[1], camera_view_matrix, subdivisions)
 
     num_max_intersection = compute_num_max_intersections_for(subdivisions)
-    image = jnp.zeros((image_height * image_width, num_max_intersection, num_voxel_assets, 4), dtype=jnp.float32)
-    index_map = jnp.zeros((image_height * image_width, num_max_intersection, 3), dtype=jnp.int32)
+
+    image = jnp.zeros((image_height * image_width, num_max_intersection, num_voxel_assets, 4), dtype=jnp.uint8)
+    index_map = jnp.zeros((image_height * image_width, num_max_intersection, 3), dtype=jnp.uint16)
 
     def body_fn(i, val):
         coords = pixel_coords[i]
@@ -422,8 +422,8 @@ def render(camera_view_matrix, subdivisions):
 
 
 # Load pre-trained VGG16 model
-vgg16 = VGG16(output='logits', pretrained='imagenet', include_head=False)
-params = vgg16.init(jax_random_key, jnp.zeros((1, image_width, image_height, 3), dtype=jnp.float32))
+#vgg16 = VGG16(output='logits', pretrained='imagenet', include_head=False)
+#params = vgg16.init(jax_random_key, jnp.zeros((1, image_width, image_height, 3), dtype=jnp.float32))
 
 
 # Extract features from specific layers
@@ -455,12 +455,11 @@ def extract_features(image, jax_random_key):
 def perceptual_loss(image_a, image_b, jax_random_key):
     loss = jnp.mean(jnp.square(extract_features(image_a, jax_random_key) - extract_features(image_b, jax_random_key)),
                     axis=-1)
-
     return loss
 
 
-def alpha_loss_fun(image_a, image_b):
-    return jnp.square(image_a[..., 3] - image_b[..., 3])
+def squared_diff(image_a, image_b, jax_random_key):
+    return jnp.square(image_a - image_b)
 
 
 def loss_fn(rendered_image, original_image, jax_random_key):
@@ -543,7 +542,7 @@ def train(camera_view_matrices, original_images, voxel_grid, num_iterations, lea
                                       get_params,
                                       opt_update, step, temperature)
         end = time.time()
-        # print(f'step took: {end - start}')
+        print(f'step took: {end - start}')
 
         if step % 100 == 0:
             print(f'step {step}/{num_iterations}: temperature={temperature};')
@@ -553,8 +552,8 @@ def train(camera_view_matrices, original_images, voxel_grid, num_iterations, lea
                                                          0.0, jax_random_key)
 
             show_visual_comparison(
-                [("Original", batch_target_images[0]), (f'Learned temperature={temperature}', rendered_images[0]),
-                 (f'Learned temperature=0', rendered_images_greedy[0])])
+                [("Original", batch_target_images[0]), (f'Learned temperature={temperature}', rendered_images[0].astype(jnp.float32)),
+                 (f'Learned temperature=0', rendered_images_greedy[0].astype(jnp.float32))])
 
     return voxel_grid
 
@@ -619,46 +618,45 @@ def show_visual_comparison(image_tuples, max_images_per_row=5):
 
 
 def gumble_softmax(logits, temperature, jax_random_key):
+    dtype = jnp.float16
+
     # Sample Gumbel noise
-    gumbel_noise = jax.random.gumbel(jax_random_key, logits.shape)
+    gumbel_noise = jax.random.gumbel(jax_random_key, logits.shape, dtype=dtype)
 
     # Perturb logits with Gumbel noise and scale by temperature
     gumbels = (logits + gumbel_noise) / temperature
 
     # Softmax to get probabilities
-    y_soft = jax.nn.softmax(gumbels, axis=-1)
+    y_soft = jax.nn.softmax(gumbels.astype(jnp.float16), axis=-1)
 
-    return lax.cond(temperature < epsilon, lambda: jax.nn.one_hot(jnp.argmax(logits, axis=-1), logits.shape[-1]),
+    return lax.cond(temperature < epsilon, lambda: jax.nn.one_hot(jnp.argmax(logits, axis=-1), logits.shape[-1], dtype=dtype),
                     lambda: y_soft)
 
 
 @jit
 def make_cache_to_image(caches, index_maps, voxel_grid, temperature, jax_random_key):
-    batch_size, image_width, image_height, max_num_intersections, num_options, _ = caches.shape
+    batch_size, image_width, image_height, _, _, _ = caches.shape
 
     # Apply Gumbel-Softmax
     voxel_logits = voxel_grid[index_maps[..., 0], index_maps[..., 1], index_maps[..., 2]]
     voxel_probs = gumble_softmax(voxel_logits, temperature, jax_random_key)
 
     # Compute the weighted sum of asset colors
-    weighted_sum = jnp.sum(caches * voxel_probs[..., None], axis=-2)
-    weighted_sum = weighted_sum.reshape(batch_size * image_width * image_height, -1, 4)
+    rgba = jnp.sum(caches * voxel_probs[..., None], axis=-2) / 255
 
-    rgba = weighted_sum[..., :4]
-    alphas = weighted_sum[..., 3:]
+    # Split rgba and alphas without reshaping
+    alphas = rgba[..., 3:]
 
     # Apply compute_final_color to each batch element
-    transparency_factors = jnp.cumprod(1.0 - alphas[..., :-1, :], axis=-2)
+    transparency_factors = jnp.cumprod(1 - alphas[..., :-1, :], axis=-2, dtype=alphas.dtype)
     transparency_factors = jnp.concatenate(
-        [jnp.ones((batch_size * image_width * image_height, 1, 1)), transparency_factors], axis=-2)
+        [jnp.ones((batch_size, image_width, image_height, 1, 1), dtype=transparency_factors.dtype), transparency_factors], axis=-2)
 
     opacity_factors = alphas * transparency_factors
 
     final_rgb = jnp.sum(rgba * opacity_factors, axis=-2)
 
-    images = final_rgb.reshape(batch_size, image_width, image_height, 4)
-
-    return images
+    return final_rgb
 
 
 @app.route('/builder', methods=['POST'])
