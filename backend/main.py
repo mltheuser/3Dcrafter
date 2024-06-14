@@ -77,9 +77,9 @@ def find_intersections(ray_origin, ray_direction, vertices, texture_coords, face
         is_invalid_intersection = jnp.logical_or(is_invalid_intersection, invalid_t)
 
         intersection_colors, intersection_distances = lax.cond(is_invalid_intersection,
-                    lambda _: do_nothing(i, t, u, v, face),
-                    lambda _: append_intersection(i, t, u, v, face),
-                    operand=None)
+                                                               lambda _: do_nothing(i, t, u, v, face),
+                                                               lambda _: append_intersection(i, t, u, v, face),
+                                                               operand=None)
 
     return intersection_colors, intersection_distances
 
@@ -376,7 +376,7 @@ def trace_ray(ray_origin, ray_direction, subdivisions):
     num_max_intersection = compute_num_max_intersections_for(subdivisions)
 
     empty_contributions = jnp.zeros((num_max_intersection, num_voxel_assets, 4), dtype=jnp.uint8)
-    empty_contribution_map = jnp.full((num_max_intersection, 3), 0, dtype=jnp.uint16)
+    empty_contribution_map = jnp.full((num_max_intersection, 3), 0, dtype=jnp.uint8)
 
     return lax.cond(no_intersection,
                     get_empty_contr,
@@ -405,7 +405,7 @@ def render(camera_view_matrix, subdivisions):
     num_max_intersection = compute_num_max_intersections_for(subdivisions)
 
     image = jnp.zeros((image_height * image_width, num_max_intersection, num_voxel_assets, 4), dtype=jnp.uint8)
-    index_map = jnp.zeros((image_height * image_width, num_max_intersection, 3), dtype=jnp.uint16)
+    index_map = jnp.zeros((image_height * image_width, num_max_intersection, 3), dtype=jnp.uint8)
 
     def body_fn(i, val):
         coords = pixel_coords[i]
@@ -422,8 +422,8 @@ def render(camera_view_matrix, subdivisions):
 
 
 # Load pre-trained VGG16 model
-#vgg16 = VGG16(output='logits', pretrained='imagenet', include_head=False)
-#params = vgg16.init(jax_random_key, jnp.zeros((1, image_width, image_height, 3), dtype=jnp.float32))
+vgg16 = VGG16(output='logits', pretrained='imagenet', include_head=False)
+params = vgg16.init(jax_random_key, jnp.zeros((1, image_width, image_height, 3), dtype=jnp.float32))
 
 
 # Extract features from specific layers
@@ -533,6 +533,9 @@ def train(camera_view_matrices, original_images, voxel_grid, num_iterations, lea
     grad_fn = jax.jit(jax.grad(compute_visual_loss_for, argnums=0))
 
     for step in range(num_iterations):
+
+        step = jnp.array(step, dtype=jnp.uint16)
+
         batch_caches, batch_index_maps, batch_target_images = get_train_batch(caches, index_maps, original_images, 4)
 
         temperature = temperature_annealing(step, 0, 1.0, 0.1, num_iterations)
@@ -627,9 +630,9 @@ def gumble_softmax(logits, temperature, jax_random_key):
     gumbels = (logits + gumbel_noise) / temperature
 
     # Softmax to get probabilities
-    y_soft = jax.nn.softmax(gumbels.astype(jnp.float16), axis=-1)
+    y_soft = jax.nn.softmax(gumbels.astype(dtype), axis=-1)
 
-    return lax.cond(temperature < epsilon, lambda: jax.nn.one_hot(jnp.argmax(logits, axis=-1), logits.shape[-1], dtype=dtype),
+    return lax.cond(temperature < epsilon, lambda: jax.nn.one_hot(jnp.argmax(logits, axis=-1), logits.shape[-1], dtype=y_soft.dtype),
                     lambda: y_soft)
 
 
@@ -648,9 +651,11 @@ def make_cache_to_image(caches, index_maps, voxel_grid, temperature, jax_random_
     alphas = rgba[..., 3:]
 
     # Apply compute_final_color to each batch element
-    transparency_factors = jnp.cumprod(1 - alphas[..., :-1, :], axis=-2, dtype=alphas.dtype)
-    transparency_factors = jnp.concatenate(
-        [jnp.ones((batch_size, image_width, image_height, 1, 1), dtype=transparency_factors.dtype), transparency_factors], axis=-2)
+    padded_alphas = jnp.concatenate([
+        jnp.zeros((batch_size, image_width, image_height, 1, 1), dtype=alphas.dtype),
+        alphas[..., :-1, :]
+    ], axis=-2)
+    transparency_factors = jnp.cumprod(1 - padded_alphas, axis=-2, dtype=alphas.dtype)
 
     opacity_factors = alphas * transparency_factors
 

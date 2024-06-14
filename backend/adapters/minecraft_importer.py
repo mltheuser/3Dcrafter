@@ -662,11 +662,11 @@ def load_glass_blocks():
 voxel_assets = [
     # *load_leaves(),
 
-    *load_state_file("data/minecraft/blockstates/honeycomb_block.json"),
+    # *load_state_file("data/minecraft/blockstates/honeycomb_block.json"),
 
-    # *load_colored_concrete(),
+    #*load_colored_concrete(),
 
-    # *load_slabs(),
+    *load_slabs(),
 
     # *load_carpets(),
 
