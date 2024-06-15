@@ -658,19 +658,34 @@ def load_glass_blocks():
         *load_state_file("data/minecraft/blockstates/pink_stained_glass.json"),
     ]
 
+def load_test_set():
+    return [
+        *load_state_file("data/minecraft/blockstates/azalea_leaves.json"),
+        *load_state_file("data/minecraft/blockstates/oak_leaves.json"),
+        *load_state_file("data/minecraft/blockstates/dirt.json"),
+        *load_state_file("data/minecraft/blockstates/cobblestone_slab.json"),
+        *load_state_file("data/minecraft/blockstates/dark_prismarine_slab.json"),
+        *load_state_file("data/minecraft/blockstates/deepslate.json"),
+        *load_state_file("data/minecraft/blockstates/stripped_birch_log.json"),
+        *load_state_file("data/minecraft/blockstates/oak_leaves.json"),
+        *load_state_file("data/minecraft/blockstates/oak_leaves.json"),
+    ]
+
 
 voxel_assets = [
-    # *load_leaves(),
+    #*load_leaves(),
 
-    # *load_state_file("data/minecraft/blockstates/honeycomb_block.json"),
+    # *load_colored_concrete(),
 
-    #*load_colored_concrete(),
-
-    *load_slabs(),
+    #*load_slabs(),
 
     # *load_carpets(),
 
     # *load_glass_blocks(),
+
+    *load_test_set(),
+
+    #*load_state_file("data/minecraft/blockstates/dirt.json"),
 
     *load_state_file("data/minecraft/blockstates/air.json"),
 ]

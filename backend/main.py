@@ -1,3 +1,12 @@
+import jax
+import jax.numpy as jnp
+from jax import lax, vmap, jit
+
+print(jax.version)
+
+jax.config.update('jax_platform_name', 'cpu')
+gpu_device = jax.devices('cpu')[0]
+
 import base64
 import io
 import math
@@ -5,20 +14,13 @@ import random
 import time
 from functools import partial
 
-import jax
-import jax.numpy as jnp
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from flaxmodels import VGG16
-from jax import lax, vmap, jit
 from jax.example_libraries import optimizers
 from matplotlib import pyplot as plt, image as mpimg
 
 from adapters.minecraft_importer import voxel_assets
-
-print(jax.version)
-
-jax.config.update('jax_backend_target', 'cpu')
 
 epsilon = 1e-6
 
@@ -315,7 +317,8 @@ def ray_voxel_traversal(intersection_point, ray_direction, subdivisions, empty_c
         )
         contributing_voxel_matrix = lax.cond(valid_grid_indices(voxel_indices, subdivisions),
                                              lambda voxel_indices, step_counter: contributing_voxel_matrix.at[
-                                                 step_counter].set(voxel_indices.astype(contributing_voxel_matrix.dtype)),
+                                                 step_counter].set(
+                                                 voxel_indices.astype(contributing_voxel_matrix.dtype)),
                                              lambda voxel_indices, step_counter: contributing_voxel_matrix,
                                              voxel_indices, step_counter
                                              )
@@ -524,19 +527,16 @@ def train(camera_view_matrices, original_images, voxel_grid, num_iterations, lea
         index_maps.append(index_map)
         print(f'{i + 1}/{num_views}')
 
-    caches = jnp.stack(caches, axis=0)
-    index_maps = jnp.stack(index_maps, axis=0)
-
     opt_init, opt_update, get_params = optimizers.adam(learning_rate)
     opt_state = opt_init(voxel_grid)
 
     grad_fn = jax.jit(jax.grad(compute_visual_loss_for, argnums=0))
 
     for step in range(num_iterations):
-
-        step = jnp.array(step, dtype=jnp.uint16)
-
-        batch_caches, batch_index_maps, batch_target_images = get_train_batch(caches, index_maps, original_images, 4)
+        # batch_caches, batch_index_maps, batch_target_images = get_train_batch(caches, index_maps, original_images, 4)
+        batch_caches = caches[0][None, ...]
+        batch_index_maps = index_maps[0][None, ...]
+        batch_target_images = original_images[0][None, ...]
 
         temperature = temperature_annealing(step, 0, 1.0, 0.1, num_iterations)
 
@@ -555,7 +555,8 @@ def train(camera_view_matrices, original_images, voxel_grid, num_iterations, lea
                                                          0.0, jax_random_key)
 
             show_visual_comparison(
-                [("Original", batch_target_images[0]), (f'Learned temperature={temperature}', rendered_images[0].astype(jnp.float32)),
+                [("Original", batch_target_images[0]),
+                 (f'Learned temperature={temperature}', rendered_images[0].astype(jnp.float32)),
                  (f'Learned temperature=0', rendered_images_greedy[0].astype(jnp.float32))])
 
     return voxel_grid
@@ -635,20 +636,20 @@ def gumble_softmax(logits, temperature, jax_random_key):
     return lax.cond(temperature < epsilon, lambda: jax.nn.one_hot(jnp.argmax(logits, axis=-1), logits.shape[-1], dtype=y_soft.dtype),
                     lambda: y_soft)
 
-
 @jit
 def make_cache_to_image(caches, index_maps, voxel_grid, temperature, jax_random_key):
-    batch_size, image_width, image_height, _, _, _ = caches.shape
+    batch_size, image_width, image_height, num_intersections, xyz = index_maps.shape
+
+    voxel_logits = voxel_grid[index_maps[..., 0], index_maps[..., 1], index_maps[..., 2]]
 
     # Apply Gumbel-Softmax
-    voxel_logits = voxel_grid[index_maps[..., 0], index_maps[..., 1], index_maps[..., 2]]
     voxel_probs = gumble_softmax(voxel_logits, temperature, jax_random_key)
 
     # Compute the weighted sum of asset colors
-    rgba = jnp.sum(caches * voxel_probs[..., None], axis=-2) / 255
+    rgba = jnp.sum(caches * voxel_probs[..., None], axis=-2)
 
     # Split rgba and alphas without reshaping
-    alphas = rgba[..., 3:]
+    alphas = rgba[..., 3:] / 255
 
     # Apply compute_final_color to each batch element
     padded_alphas = jnp.concatenate([
@@ -657,9 +658,7 @@ def make_cache_to_image(caches, index_maps, voxel_grid, temperature, jax_random_
     ], axis=-2)
     transparency_factors = jnp.cumprod(1 - padded_alphas, axis=-2, dtype=alphas.dtype)
 
-    opacity_factors = alphas * transparency_factors
-
-    final_rgb = jnp.sum(rgba * opacity_factors, axis=-2)
+    final_rgb = jnp.sum(rgba * transparency_factors, axis=-2) / 255
 
     return final_rgb
 
