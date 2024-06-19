@@ -10,6 +10,8 @@ You load in some 3D model and the program will try to recreate it as faithful as
 
 <img width="1710" alt="Screenshot 2024-06-19 at 08 44 24" src="https://github.com/mltheuser/3Dcrafter/assets/25958978/e5246225-e148-4c54-a518-fc9137b740c5">
 
+Note: There is a clear discrepancy between the training renderer and the ingame render (occlusion and lighting). Briding this gap however will need a fundamentaly different approach to the current one. Maybe something for a second iteration of this project^^.
+
 ### Minecraft Importer
 
 We load blocks directly from the games asset folder and convert them from their blockstate representation [https://minecraft.fandom.com/wiki/Tutorials/Models] into trinagulated textured meshes.
